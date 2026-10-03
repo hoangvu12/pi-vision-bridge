@@ -133,7 +133,7 @@ In pi's settings (`~/.pi/agent/settings.json`, or per-project `.pi/settings.json
 }
 ```
 
-pi has no official per-extension settings section, but unknown keys survive its loader and reach extensions, so this works as a read layer (project scope gives you per-project vision models). The `/visionbridge` command cannot write into pi's settings, so it manages the extension's own file instead; if both set the same field, the settings section wins and `/visionbridge status` says so.
+pi has no official per-extension settings section, but unknown keys survive its loader, so the extension reads the section straight from pi's settings files and mirrors pi's own resolution (global first, project over global; `PI_CODING_AGENT_DIR` is honored). Project scope gives you per-project vision models. The `/visionbridge` command cannot write into pi's settings, so it manages the extension's own file instead; if both set the same field, the settings section wins and `/visionbridge status` says so.
 
 Commands (they write `~/.pi/agent/pi-vision-bridge.json`, atomic writes, `0600`):
 

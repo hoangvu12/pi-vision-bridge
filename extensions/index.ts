@@ -65,6 +65,7 @@ import {
 	debug,
 	isEnvDisabled,
 	loadConfig,
+	readPiSettingsSection,
 	saveConfig,
 } from "../src/config.ts";
 import {
@@ -147,46 +148,13 @@ export default function visionBridge(pi: ExtensionAPI) {
 		videoFrames: "PI_VISION_BRIDGE_VIDEO_FRAMES",
 	};
 
-	/**
-	 * pi's settings.json has no official per-extension section, but unknown
-	 * keys survive its loader and deep merge, and getSettings() exposes the
-	 * merged result. So an optional "visionBridge" block (global AND project
-	 * scope; project wins via pi's own merge) is honored as a config layer.
-	 * Unknown keys inside the block are ignored, never rejected.
-	 */
-	type SettingsLike = { getSettings?: () => unknown };
-	function readPiSection(source: unknown): Partial<BridgeConfig> | undefined {
-		const getter = (source as SettingsLike | undefined)?.getSettings;
-		if (typeof getter !== "function") return undefined;
-		try {
-			const settings = (getter as () => unknown)() as { visionBridge?: Record<string, unknown> } | undefined;
-			const raw = settings?.visionBridge;
-			if (!raw || typeof raw !== "object") return undefined;
-			const out: Partial<BridgeConfig> = {};
-			if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
-			if (Array.isArray(raw.visionModels)) {
-				const list = raw.visionModels
-					.filter((s): s is string => typeof s === "string")
-					.map((s) => s.trim())
-					.filter((s) => s.length > 0);
-				if (list.length > 0) out.visionModels = list;
-			}
-			if (typeof raw.maxTokens === "number" && raw.maxTokens > 0) out.maxTokens = raw.maxTokens;
-			if (typeof raw.temperature === "number" && raw.temperature >= 0) out.temperature = raw.temperature;
-			if (typeof raw.cacheMax === "number" && raw.cacheMax > 0) out.cacheMax = raw.cacheMax;
-			if (typeof raw.notify === "boolean") out.notify = raw.notify;
-			if (typeof raw.videoFrames === "number" && raw.videoFrames > 0) out.videoFrames = raw.videoFrames;
-			return out;
-		} catch (err) {
-			debug("pi settings read failed:", err instanceof Error ? err.message : err);
-			return undefined;
-		}
-	}
-
 	/** Effective config: defaults <- file <- pi-settings section <- env. */
-	function buildConfig(source: unknown): BridgeConfig {
+	function buildConfig(cwd: string | undefined): BridgeConfig {
 		const base = isEnvDisabled() ? { ...loadConfig(), enabled: false } : loadConfig();
-		const section = readPiSection(source);
+		// The visionBridge section from pi's own settings files (global and
+		// project; project wins). cwd comes from the event context; at
+		// construction time only the global file is readable.
+		const section = readPiSettingsSection(cwd);
 		piSettingsActive = section !== undefined && Object.keys(section).length > 0;
 		if (!section) return base;
 		const next = { ...base };
@@ -199,7 +167,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 	}
 
 	let piSettingsActive = false; // set by buildConfig; true when a visionBridge section applied
-	let config = buildConfig(pi);
+	let config = buildConfig(undefined);
 
 	// LRU cache: key -> description. Map preserves insertion order.
 	const cache = new Map<string, CacheEntry>();
@@ -217,7 +185,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 	let lastNotifyKey = "";
 
 	function refreshConfig(ctx: ExtensionContext): void {
-		config = buildConfig(ctx);
+		config = buildConfig(ctx.cwd);
 	}
 
 	function cacheGet(hash: string): CacheEntry | undefined {

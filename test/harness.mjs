@@ -8,7 +8,7 @@
  */
 
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, readdirSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
@@ -1028,7 +1028,10 @@ writeFileSync(
 	join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"),
 	JSON.stringify({ visionModels: ["test/from-file"] }),
 );
-const piSettingsCtx = (section) => {
+// The section lives in pi's own settings file (global), read directly.
+const piSettingsFile = join(fakeHome, ".pi", "agent", "settings.json");
+const setPiSettings = (section) => writeFileSync(piSettingsFile, JSON.stringify({ visionBridge: section }));
+const piSettingsCtx = () => {
 	const c = captureCtx(fakeModel(["text"]));
 	c.modelRegistry = {
 		...c.modelRegistry,
@@ -1048,10 +1051,10 @@ const piSettingsCtx = (section) => {
 			};
 		},
 	};
-	c.getSettings = () => ({ visionBridge: section });
 	return c;
 };
-const fromSettings = piSettingsCtx({ visionModels: ["test/pi-settings-model"], videoFrames: 7 });
+setPiSettings({ visionModels: ["test/pi-settings-model"], videoFrames: 7 });
+const fromSettings = piSettingsCtx();
 fromSettings.sessionManager = {
 	getBranch: () => [{ type: "message", message: { role: "user", content: [makeImage("pi-cfg")], timestamp: 1 } }],
 };
@@ -1060,13 +1063,14 @@ const piCfgResult = await imageTool.execute("pi-cfg-1", { question: "x" }, undef
 assert.ok(piCfgResult.details.model.includes("pi-settings-model"), "visionBridge section from pi settings selects the model");
 // env still wins over the pi-settings section
 process.env.PI_VISION_BRIDGE_MODEL = "test/pi-settings-model-2";
-const envWins = piSettingsCtx({ visionModels: ["test/pi-settings-model"] });
+const envWins = piSettingsCtx();
 envWins.sessionManager = fromSettings.sessionManager;
 const envResult = await imageTool.execute("pi-cfg-2", { question: "y" }, undefined, undefined, envWins);
 assert.ok(envResult.details.model.includes("pi-settings-model-2"), "env var beats the pi-settings section");
 delete process.env.PI_VISION_BRIDGE_MODEL;
 // a section with unknown fields is tolerated
-const tolerated = piSettingsCtx({ visionModels: ["test/pi-settings-model"], bogusKey: "whatever" });
+setPiSettings({ visionModels: ["test/pi-settings-model"], bogusKey: "whatever" });
+const tolerated = piSettingsCtx();
 tolerated.sessionManager = fromSettings.sessionManager;
 const toleratedResult = await imageTool.execute("pi-cfg-3", { question: "z" }, undefined, undefined, tolerated);
 assert.ok(toleratedResult.details.model.includes("pi-settings-model"), "unknown fields in the visionBridge section are ignored");
@@ -1083,11 +1087,12 @@ assert.deepEqual(legacyConfig.loadConfig().visionModels, ["test/a", "test/b"], "
 delete process.env.PI_VISION_BRIDGE_MODEL;
 // status mentions the pi-settings source when active
 notifications.length = 0;
-await registered.commands.visionbridge.handler("status", piSettingsCtx({ visionModels: ["test/pi-settings-model"] }));
+setPiSettings({ visionModels: ["test/pi-settings-model"] });
+await registered.commands.visionbridge.handler("status", piSettingsCtx());
 assert.ok(notifyLines().includes("from pi settings"), "status names the pi-settings source");
 
 // --- the in-context swap path also honors the pi-settings section ---
-const swapSettingsCtx = piSettingsCtx({ visionModels: ["test/pi-settings-model"] });
+const swapSettingsCtx = piSettingsCtx();
 capturedCalls.length = 0;
 const swapFromSettings = await handlers.context[0](
 	{
@@ -1104,6 +1109,26 @@ assert.ok(
 	"context swap analyzes via the model from the visionBridge section",
 );
 assert.ok(swapFromSettings.messages[0].content[0].text.includes("pi settings ok"), "swap text carries the description");
+
+// --- project scope (.pi/settings.json) wins over the global section ---
+const projDir = mkdtempSync(join(tmpdir(), "pi-vbridge-proj-"));
+mkdirSync(join(projDir, ".pi"), { recursive: true });
+writeFileSync(
+	join(projDir, ".pi", "settings.json"),
+	JSON.stringify({ visionBridge: { visionModels: ["test/pi-settings-model-proj"] } }),
+);
+const projCtx = piSettingsCtx();
+projCtx.cwd = projDir;
+projCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [makeImage("proj-scope")], timestamp: 1 } }],
+};
+const projResult = await imageTool.execute("proj-1", { question: "p" }, undefined, undefined, projCtx);
+assert.ok(
+	projResult.details.model.includes("pi-settings-model-proj"),
+	"project .pi/settings.json wins over the global section",
+);
+rmSync(projDir, { recursive: true, force: true });
+rmSync(piSettingsFile, { force: true });
 
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });

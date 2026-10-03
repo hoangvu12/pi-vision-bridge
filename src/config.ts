@@ -40,7 +40,14 @@ export interface BridgeConfig {
 	videoFrames: number;
 }
 
-export const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-vision-bridge.json");
+/** pi's agent dir, mirroring pi's own resolution (incl. its env override). */
+function piAgentDir(): string {
+	const envDir = process.env.PI_CODING_AGENT_DIR;
+	if (envDir) return envDir.replace(/^~(?=$|[\/])/, homedir());
+	return join(homedir(), ".pi", "agent");
+}
+
+export const CONFIG_PATH = join(piAgentDir(), "pi-vision-bridge.json");
 
 const DEFAULTS: BridgeConfig = {
 	enabled: true,
@@ -67,6 +74,51 @@ function envNumber(name: string): number | undefined {
 	if (raw === undefined) return undefined;
 	const n = Number(raw);
 	return Number.isFinite(n) && n > 0 ? n : undefined;
+}
+
+/**
+ * The optional "visionBridge" section in pi's own settings: global
+ * (<agentDir>/settings.json) and project (<cwd>/.pi/settings.json), project
+ * winning over global like pi's own merge. pi has no official
+ * per-extension settings section, but unknown keys survive its loader, so a
+ * section there works as a read layer. Returns validated known fields only;
+ * unknown keys inside the section are ignored, never rejected.
+ */
+export function readPiSettingsSection(cwd: string | undefined): Partial<BridgeConfig> | undefined {
+	const extract = (path: string): Record<string, unknown> | undefined => {
+		try {
+			if (!existsSync(path)) return undefined;
+			const parsed = JSON.parse(readFileSync(path, "utf8")) as { visionBridge?: Record<string, unknown> };
+			const raw = parsed?.visionBridge;
+			return raw && typeof raw === "object" ? raw : undefined;
+		} catch (err) {
+			debug("pi settings read failed:", path, err instanceof Error ? err.message : err);
+			return undefined;
+		}
+	};
+	const globalRaw = extract(join(piAgentDir(), "settings.json"));
+	const projectRaw = cwd ? extract(join(cwd, ".pi", "settings.json")) : undefined;
+	if (!globalRaw && !projectRaw) return undefined;
+	return validateSection({ ...globalRaw, ...projectRaw });
+}
+
+/** Keep only known, well-typed fields from a visionBridge section. */
+function validateSection(raw: Record<string, unknown>): Partial<BridgeConfig> {
+	const out: Partial<BridgeConfig> = {};
+	if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+	if (Array.isArray(raw.visionModels)) {
+		const list = raw.visionModels
+			.filter((s): s is string => typeof s === "string")
+			.map((s) => s.trim())
+			.filter((s) => s.length > 0);
+		if (list.length > 0) out.visionModels = list;
+	}
+	if (typeof raw.maxTokens === "number" && raw.maxTokens > 0) out.maxTokens = raw.maxTokens;
+	if (typeof raw.temperature === "number" && raw.temperature >= 0) out.temperature = raw.temperature;
+	if (typeof raw.cacheMax === "number" && raw.cacheMax > 0) out.cacheMax = raw.cacheMax;
+	if (typeof raw.notify === "boolean") out.notify = raw.notify;
+	if (typeof raw.videoFrames === "number" && raw.videoFrames > 0) out.videoFrames = raw.videoFrames;
+	return out;
 }
 
 export function isEnvDisabled(): boolean {
