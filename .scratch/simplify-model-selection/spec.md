@@ -24,6 +24,27 @@ give the user an ordered list instead.
   load and treated as a one-entry list. `PI_VISION_BRIDGE_MODEL` now
   accepts a comma-separated ordered list.
 
+## Decisions added mid-implementation (config in pi's own settings)
+
+The user asked for configuration in pi's settings.json itself. Settled:
+
+- A `visionBridge` section is honored from pi's own settings files:
+  global `<agentDir>/settings.json` and project `<cwd>/.pi/settings.json`
+  (project wins, mirroring pi's merge). `PI_CODING_AGENT_DIR` is honored
+  for the agent dir.
+- pi has no official per-extension settings section, and although its
+  0.87 type declarations expose `ExtensionContext.getSettings` /
+  `ExtensionAPI.getSettings`, neither exists at runtime (verified with a
+  probe extension during live testing). The section is therefore read
+  directly from the files.
+- Precedence: environment variables > pi-settings section > the
+  extension's own config file > defaults. `/visionbridge` commands keep
+  writing the extension's own file; the settings section shadows it and
+  `/visionbridge status` names the active source.
+- Config is refreshed per request (context event, before_agent_start,
+  tool executes, commands), not only at construction time — a settings
+  or file change between requests takes effect on the next one.
+
 ## Out of scope
 
 Quality calibration probes (parked), cross-session disk cache of
