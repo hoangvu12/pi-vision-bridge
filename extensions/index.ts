@@ -69,7 +69,7 @@ import {
 	type VisionAnalysis,
 	type VisionCandidate,
 } from "../src/vision.ts";
-import { buildSwapText, IMAGE_TOOL } from "../src/prompts.ts";
+import { ANALYSIS_MODES, buildSwapText, IMAGE_TOOL, modesGuidanceList, resolveModePrompt } from "../src/prompts.ts";
 import { analyzeVideo, probeVideo, VIDEO_EXTENSIONS, videoFingerprint } from "../src/video.ts";
 
 const VIDEO_TOOL = "describe_video";
@@ -86,6 +86,7 @@ interface ToolDetails {
 	fingerprint: string;
 	model: string;
 	question?: string;
+	mode?: string;
 	cached: boolean;
 	media?: "image" | "video";
 	frames?: number;
@@ -255,6 +256,21 @@ export default function visionBridge(pi: ExtensionAPI) {
 		return job;
 	}
 
+	/**
+	 * Cache key for a targeted image analysis. Every analysis-shaping input
+	 * (fingerprint, mode, region, question) is encoded explicitly, so no two
+	 * different analyses can ever share a key and omitting all of them keeps
+	 * today's per-(image, question) semantics.
+	 */
+	function toolCacheKey(args: {
+		fingerprint: string;
+		mode?: string;
+		region?: number[];
+		question?: string;
+	}): string {
+		return `q:${JSON.stringify([args.fingerprint, args.mode ?? null, args.region ?? null, args.question ?? null])}`;
+	}
+
 	/** Collect every image present in request messages, in order, deduped by hash. */
 	function collectImages(messages: AgentMessage[]): { refs: Map<string, ImageRef>; order: string[] } {
 		const refs = new Map<string, ImageRef>();
@@ -410,8 +426,12 @@ export default function visionBridge(pi: ExtensionAPI) {
 			"Use it when an inline [Image <fingerprint>] description lacks a detail you need — the exact text of a " +
 			"specific line, a color, a small region, or a comparison. Pass the fingerprint from the image's tag; " +
 			"omit it to inspect the most recent image. Pass `question` describing exactly what to look for; " +
-			"omit it for a full fresh description.",
-		promptSnippet: "Re-inspect an image with a focused question when its inline description is not enough.",
+			"omit it for a full fresh description. " +
+			"Optional `mode` tunes how the image is read — use when: " +
+			`${modesGuidanceList()}. ` +
+			"Without a mode you get a thorough generic description.",
+		promptSnippet:
+			"Re-inspect an image with a focused question or a task mode (ocr, error, ui, diagram, chart) when its inline description is not enough.",
 		parameters: Type.Object({
 			question: Type.Optional(
 				Type.String({
@@ -424,6 +444,16 @@ export default function visionBridge(pi: ExtensionAPI) {
 				Type.String({
 					description:
 						"The image id from an [Image <fingerprint>] tag in the conversation. Omit to use the most recent image.",
+				}),
+			),
+			mode: Type.Optional(
+				Type.Union([...ANALYSIS_MODES.map((m) => Type.Literal(m))], {
+					description:
+						"Reading mode: ocr (verbatim transcription — use when you need the exact words), " +
+						"error (error messages and stack traces — use on failure screenshots and logs), " +
+						"ui (component and layout inventory — use on interface screenshots), " +
+						"diagram (nodes, arrows, relationships — use on flowcharts and architecture), " +
+						"chart (axes, series, values — use on plots and graphs). Omit for a generic thorough description.",
 				}),
 			),
 		}),
@@ -501,20 +531,43 @@ export default function visionBridge(pi: ExtensionAPI) {
 				};
 			}
 
-			// Targeted answers are cached per (image, question) — the common
-			// retry loop (model re-asking the same thing) stays free.
-			const cacheKey = `q:${target.fingerprint}:${params.question ?? ""}`;
+			const mode: string | undefined = params.mode;
+			if (mode !== undefined && !ANALYSIS_MODES.includes(mode as never)) {
+				// Schema validation rejects this before execute; guard direct calls.
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Unknown mode "${mode}". Valid modes: ${ANALYSIS_MODES.join(", ")}. Omit mode for a generic description.`,
+						},
+					],
+					details: { fingerprint: target.fingerprint, model: "", mode, cached: false },
+					isError: true,
+				};
+			}
+
+			// Targeted answers are cached per (image, mode, question) — every
+			// analysis-shaping input is in the key, so two modes over the same
+			// image are two analyses, and the common retry loop (model re-asking
+			// the same thing) stays free.
+			const cacheKey = toolCacheKey({
+				fingerprint: target.fingerprint,
+				mode,
+				question: params.question,
+			});
 			const hit = cacheGet(cacheKey);
 			if (hit) {
 				return {
 					content: [{ type: "text", text: hit.description }],
-					details: { fingerprint: target.fingerprint, model: hit.model, question: params.question, cached: true },
+					details: { fingerprint: target.fingerprint, model: hit.model, question: params.question, mode, cached: true },
 				};
 			}
 
+			const prompt = mode ? resolveModePrompt(mode, params.question) : undefined;
 			const started = Date.now();
 			const { result } = await runWithFallback(ctx, (model) =>
 				analyzeImage(ctx, model, target!.image, {
+					prompt,
 					question: params.question,
 					maxTokens: config.maxTokens,
 					temperature: config.temperature,
@@ -527,7 +580,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 				content: [{ type: "text", text: result.description }],
 				// usage from the nested call keeps session statistics accurate.
 				usage: result.usage,
-				details: { fingerprint: target.fingerprint, model: result.model, question: params.question, cached: false },
+				details: { fingerprint: target.fingerprint, model: result.model, question: params.question, mode, cached: false },
 			};
 		},
 	});

@@ -369,6 +369,108 @@ assert.equal(
 assert.equal(capturedCalls.length, 1, "one nested vision call for the swap");
 assert.equal(imageBlocks(lastCall()).length, 1, "swap analysis sends one image");
 
+// =====================================================================
+// Ticket 02: task-typed analysis modes on describe_image
+// =====================================================================
+
+// --- tool schema: optional mode restricted to the five values ---
+const modeParam = imageTool.parameters.properties.mode;
+assert.ok(modeParam, "mode parameter present");
+assert.ok(!imageTool.parameters.required?.includes("mode"), "mode optional");
+const { Value } = await import("typebox/value");
+for (const m of ["ocr", "error", "ui", "diagram", "chart"]) {
+	assert.ok(Value.Check(modeParam, m), `mode schema accepts "${m}"`);
+}
+assert.ok(!Value.Check(modeParam, "bogus"), "mode schema rejects unknown values");
+assert.ok(!Value.Check(modeParam, 3), "mode schema rejects non-strings");
+
+// --- each mode resolves to a distinct curated prompt that reaches the model ---
+const modeImage = { type: "image", data: Buffer.from("mode-test-image").toString("base64"), mimeType: "image/png" };
+const modeCtx = captureCtx(fakeModel(["text"]));
+modeCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [modeImage], timestamp: 1 } }],
+};
+const modePrompts = new Map();
+for (const mode of ["ocr", "error", "ui", "diagram", "chart"]) {
+	capturedCalls.length = 0;
+	const r = await imageTool.execute(`mode-${mode}`, { mode }, undefined, undefined, modeCtx);
+	assert.equal(r.details.mode, mode, `details record the mode (${mode})`);
+	assert.ok(lastCall(), `mode ${mode}: a model call happened`);
+	modePrompts.set(mode, { sys: lastCall().context.systemPrompt, user: textBlocks(lastCall())[0].text });
+}
+assert.equal(new Set([...modePrompts.values()].map((v) => v.sys)).size, 5, "five modes -> five distinct system prompts");
+assert.match(modePrompts.get("ocr").sys, /transcribe/i, "ocr prompt: transcription focus");
+assert.match(modePrompts.get("error").sys, /stack trace/i, "error prompt: stack-trace focus");
+assert.match(modePrompts.get("ui").sys, /component/i, "ui prompt: component focus");
+assert.match(modePrompts.get("diagram").sys, /arrow/i, "diagram prompt: arrow/relationship focus");
+assert.match(modePrompts.get("chart").sys, /axis|series/i, "chart prompt: axes/series focus");
+
+// --- question folds into the mode prompt ---
+capturedCalls.length = 0;
+await imageTool.execute("mode-q", { mode: "error", question: "which file failed" }, undefined, undefined, modeCtx);
+assert.ok(
+	textBlocks(lastCall())[0].text.includes("which file failed"),
+	"question reaches the mode prompt",
+);
+assert.ok(
+	textBlocks(lastCall())[0].text.includes(modePrompts.get("error").user.split("\n")[0]),
+	"mode base instruction kept alongside the question",
+);
+
+// --- cache key includes mode ---
+const cacheImage = { type: "image", data: Buffer.from("cache-test-image").toString("base64"), mimeType: "image/png" };
+const cacheModeCtx = captureCtx(fakeModel(["text"]));
+cacheModeCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [cacheImage], timestamp: 1 } }],
+};
+capturedCalls.length = 0;
+await imageTool.execute("cache-1", { mode: "ocr" }, undefined, undefined, cacheModeCtx);
+const hitResult = await imageTool.execute("cache-2", { mode: "ocr" }, undefined, undefined, cacheModeCtx);
+assert.equal(capturedCalls.length, 1, "same image + same mode twice: one call");
+assert.equal(hitResult.details.cached, true, "cache hit flagged");
+await imageTool.execute("cache-3", { mode: "chart" }, undefined, undefined, cacheModeCtx);
+assert.equal(capturedCalls.length, 2, "same image, different mode: separate analysis");
+
+// --- no mode: exactly today's generic behavior ---
+const genericImage = { type: "image", data: Buffer.from("generic-image").toString("base64"), mimeType: "image/png" };
+const genericCtx = captureCtx(fakeModel(["text"]));
+genericCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [genericImage], timestamp: 1 } }],
+};
+capturedCalls.length = 0;
+await imageTool.execute("generic-q", { question: "what color is the header" }, undefined, undefined, genericCtx);
+assert.ok(lastCall().context.systemPrompt.includes("TEXT FIRST"), "no mode: generic system prompt");
+assert.ok(
+	textBlocks(lastCall())[0].text.startsWith("Answer this question about the image"),
+	"no mode: question prompt shape unchanged",
+);
+await imageTool.execute("generic-q2", { question: "what color is the header" }, undefined, undefined, genericCtx);
+assert.equal(capturedCalls.length, 1, "no mode: cached per (image, question) as today");
+await imageTool.execute("generic-m", { question: "what color is the header", mode: "ui" }, undefined, undefined, genericCtx);
+assert.equal(capturedCalls.length, 2, "mode never aliases the no-mode cache entry");
+await imageTool.execute("generic-none", {}, undefined, undefined, genericCtx);
+assert.equal(capturedCalls.length, 3, "no question: its own analysis");
+assert.equal(textBlocks(lastCall())[0].text, "Describe this image.", "no mode, no question: generic user prompt");
+
+// --- tool description and prompt snippet enumerate the modes ---
+for (const m of ["ocr", "error", "ui", "diagram", "chart"]) {
+	assert.ok(imageTool.description.includes(m), `tool description mentions ${m}`);
+}
+assert.ok(/use when|use on/i.test(imageTool.description), "tool description gives use-when guidance");
+assert.ok(/mode/i.test(imageTool.promptSnippet), "prompt snippet mentions modes");
+
+// --- in-context swap is untouched by modes ---
+capturedCalls.length = 0;
+const swapImageMsg = [
+	{ role: "user", content: [{ type: "text", text: "look" }, { type: "image", data: Buffer.from("swap-no-mode").toString("base64"), mimeType: "image/png" }], timestamp: 1 },
+];
+await handlers.context[0]({ type: "context", messages: structuredClone(swapImageMsg) }, captureCtx(fakeModel(["text"])));
+assert.ok(
+	lastCall().context.systemPrompt.includes("TEXT FIRST"),
+	"context swap still uses the generic prompt (never a mode)",
+);
+assert.equal(imageBlocks(lastCall()).length, 1, "context swap analyzes one image");
+
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });
 console.log("ALL HARNESS TESTS PASSED");
