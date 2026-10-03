@@ -35,8 +35,8 @@ The design borrows its mechanics from the OpenCode vision plugins ([opencode-ima
 | Generic cached description + targeted `describe_image` tool | Intent-aware descriptions (passing the current question to the vision model) break cache coherence across turns. The generic description is complete and cacheable; the tool provides the focused re-look ("quote the exact error text"). |
 | Video via frame sampling, not native video APIs | pi's model layer has no video content type, so native video (z.ai's `video_url` for GLM-4.6V) would mean provider-specific raw HTTP + auth for exactly one provider. Frames work with every vision model through pi's own provider stack. Uniform sampling with a frame cap, 768px scaling, and per-frame timestamps follows the video-understanding research (multigrid.ai, ffmpeg-cookbook) for token-efficient chronological coverage. |
 | Prompt hint on video references | Videos can't enter pi messages, so they arrive as text path references. A `before_agent_start` prompt section tells the model a video file exists and to call the tool: discoverability without eager analysis. |
-| Ranked candidate list + health rotation | A relay listing a model (the `/models` catalog) says nothing about its upstream actually serving it. Failed models are benched for 5 minutes and the analysis rotates to the next candidate; the winner sticks. (opencode-see-image's route-fallback pattern.) |
-| Route-diversified ranking | At most 2 candidates per id prefix (upstream route), so one dead route can't fill the whole pool. |
+| Ordered candidate list + health rotation | A relay listing a model (the `/models` catalog) says nothing about its upstream actually serving it. Failed models are benched for 5 minutes and the analysis rotates to the next candidate; the winner sticks. (opencode-see-image's route-fallback pattern.) No name-based scoring: a model name says nothing a test has verified, so auto mode just uses catalog order and the user can set an explicit order. |
+| Route-diversified pool (auto mode) | At most 2 candidates per id prefix (upstream route), so one dead route can't fill the whole pool. |
 | No-tools helper call | The vision model processes attacker-influenceable content (the media). It only ever receives the media and a fixed prompt, never tools, files, or bash. This is the pi-native fix for opencode-see-image issue #6. |
 | Prompt: factual, verbatim-OCR, structured | Vision models paraphrase text unless told to transcribe exactly; factual framing measurably reduces hallucination; temperature 0 keeps descriptions deterministic. |
 | Auto-hide image tool for vision models | Zero prompt tokens, zero latency: `describe_image` is removed from the active set and the context handler exits immediately. `describe_video` stays, since no model in pi can watch video. |
@@ -110,26 +110,47 @@ Requirements: at least one connected vision-capable model (any provider you've a
 
 ### Model selection
 
-6. Ranked candidates from your connected, authenticated, image-capable models. Scoring prefers cheap/fast tiers (`flash`, `mini`, `nano`, `haiku`, `lite`, `turbo`…), strong-OCR families, non-reasoning models, and low price, then diversifies across upstream routes. The best pick wins; on failure the next candidate takes over.
+6. Ordered candidates, with no quality guessing. Set your own list and it is used in exactly that order:
+   - one entry pins a model (no fallback: if its upstream dies, analysis fails until you change it);
+   - several entries are a fallback chain: a failed model is benched for 5 minutes and the next entry takes over; the winner sticks for the session.
+   With no list configured, candidates are your connected, authenticated, image-capable models in catalog order, diversified across upstream routes. A model name says nothing about quality, so nothing is scored; health rotation handles what can actually be verified, which is availability.
 
 7. Tool visibility sync: on `session_start` / `model_select`, `describe_image` hides for vision models and shows for text-only models. `describe_video` and `compare_images` are always shown (when enabled).
 
 ## Configuration
 
+Four layers, most specific wins: environment variables, then a `visionBridge` section in pi's own settings, then the extension's config file, then defaults.
+
+In pi's settings (`~/.pi/agent/settings.json`, or per-project `.pi/settings.json`, where project wins):
+
+```jsonc
+{
+  "visionBridge": {
+    "visionModels": ["provider/model-id", "provider/model-id-2"],  // ordered; null/omitted = auto
+    "enabled": true,
+    "videoFrames": 10
+  }
+}
+```
+
+pi has no official per-extension settings section, but unknown keys survive its loader and reach extensions, so this works as a read layer (project scope gives you per-project vision models). The `/visionbridge` command cannot write into pi's settings, so it manages the extension's own file instead; if both set the same field, the settings section wins and `/visionbridge status` says so.
+
+Commands (they write `~/.pi/agent/pi-vision-bridge.json`, atomic writes, `0600`):
+
 ```bash
-/visionbridge                                # status: config, ranked vision models, cache, tools
-/visionbridge model google/gemini-2.5-flash  # pin a specific vision model (no fallback)
-/visionbridge auto                           # back to auto-selection with fallback
+/visionbridge                                # status: config source, candidate order, cache, tools
+/visionbridge model a/provider-id b/other    # one model pins it; several set an ordered fallback list
+/visionbridge auto                           # back to catalog order with fallback
 /visionbridge on | off                       # master switch
 /visionbridge cache clear                    # drop cached descriptions
 ```
 
-Config file `~/.pi/agent/pi-vision-bridge.json` (written by the commands, atomic writes, `0600`):
+Config file:
 
 ```jsonc
 {
   "enabled": true,
-  "visionModel": null,        // "provider/model-id" or null = auto
+  "visionModels": null,       // ["provider/model-id", …] ordered; null = auto (a legacy single "visionModel" string still loads as a pin)
   "maxTokens": 2048,          // description output cap
   "temperature": 0,           // deterministic descriptions
   "cacheMax": 64,             // LRU entries
@@ -142,7 +163,7 @@ Environment overrides (useful in print/JSON mode):
 
 | Variable | Effect |
 |---|---|
-| `PI_VISION_BRIDGE_MODEL` | Pin vision model `provider/model-id` |
+| `PI_VISION_BRIDGE_MODEL` | Pin one vision model `provider/model-id`, or an ordered comma-separated list |
 | `PI_VISION_BRIDGE_OFF=1` | Disable the extension |
 | `PI_VISION_BRIDGE_MAX_TOKENS` | Output cap |
 | `PI_VISION_BRIDGE_CACHE_MAX` | Cache cap |
@@ -155,7 +176,7 @@ Environment overrides (useful in print/JSON mode):
 |---|---|
 | Active model has image input | Images pass through natively, `describe_image` hidden, `describe_video` still available |
 | Active model is text-only | Images swapped for descriptions before the request |
-| Vision model upstream down | Rotate to next ranked candidate; failures benched 5 min |
+| Vision model upstream down | Rotate to the next entry in your list (or next auto candidate); failures benched 5 min |
 | All candidates down | Model sees a clear failure note + retry hint; it won't hallucinate |
 | Same image again later | Cache hit: free |
 | Need the exact words, an error's details, or a chart's values | `describe_image` with `mode: ocr / error / ui / diagram / chart` |

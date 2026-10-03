@@ -4,7 +4,8 @@
  * Stored at ~/.pi/agent/pi-vision-bridge.json. Every field can be overridden
  * by environment variables so headless / print-mode usage needs no file:
  *
- *   PI_VISION_BRIDGE_MODEL       "provider/model-id"  explicit vision model
+ *   PI_VISION_BRIDGE_MODEL       "provider/model-id" or comma-separated
+ *                                ordered list of vision models
  *   PI_VISION_BRIDGE_OFF=1       disable the extension entirely
  *   PI_VISION_BRIDGE_MAX_TOKENS  description output cap
  *   PI_VISION_BRIDGE_CACHE_MAX   cache entry cap
@@ -21,8 +22,12 @@ import { join } from "node:path";
 export interface BridgeConfig {
 	/** Master switch. When false, media pass through untouched. */
 	enabled: boolean;
-	/** Explicit vision model as "provider/model-id". null = auto-select. */
-	visionModel: string | null;
+	/**
+	 * Ordered vision-model candidate list ("provider/model-id" entries).
+	 * null = auto-select from the catalog. One entry = a pinned model with
+	 * no fallback; several entries = health rotation in exactly this order.
+	 */
+	visionModels: string[] | null;
 	/** Max output tokens for the description call. */
 	maxTokens: number;
 	/** Sampling temperature for the vision call. 0 = deterministic. */
@@ -39,7 +44,7 @@ export const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-vision-bridge.jso
 
 const DEFAULTS: BridgeConfig = {
 	enabled: true,
-	visionModel: null,
+	visionModels: null,
 	maxTokens: 2048,
 	temperature: 0,
 	cacheMax: 64,
@@ -74,10 +79,21 @@ export function loadConfig(): BridgeConfig {
 
 	if (existsSync(CONFIG_PATH)) {
 		try {
-			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<BridgeConfig>;
+			const raw = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Partial<BridgeConfig> & {
+				/** Legacy single-model field (pre-1.1). */
+				visionModel?: unknown;
+			};
 			if (typeof raw.enabled === "boolean") config.enabled = raw.enabled;
-			if (raw.visionModel === null || typeof raw.visionModel === "string") {
-				config.visionModel = raw.visionModel;
+			if (Array.isArray(raw.visionModels)) {
+				const list = raw.visionModels
+					.filter((s): s is string => typeof s === "string")
+					.map((s) => s.trim())
+					.filter((s) => s.length > 0);
+				if (list.length > 0) config.visionModels = list;
+			}
+			// Legacy single-model field (pre-1.1): tolerated, treated as a one-entry pin.
+			if (config.visionModels === null && typeof raw.visionModel === "string" && raw.visionModel.trim()) {
+				config.visionModels = [raw.visionModel.trim()];
 			}
 			if (typeof raw.maxTokens === "number" && raw.maxTokens > 0) config.maxTokens = raw.maxTokens;
 			if (typeof raw.temperature === "number" && raw.temperature >= 0) config.temperature = raw.temperature;
@@ -91,8 +107,11 @@ export function loadConfig(): BridgeConfig {
 		}
 	}
 
-	const envModel = process.env.PI_VISION_BRIDGE_MODEL?.trim();
-	if (envModel) config.visionModel = envModel;
+	// One spec pins a single model; comma-separated specs give an ordered list.
+	const envModels = process.env.PI_VISION_BRIDGE_MODEL?.split(",")
+		.map((s) => s.trim())
+		.filter((s) => s.length > 0);
+	if (envModels && envModels.length > 0) config.visionModels = envModels;
 	const envMax = envNumber("PI_VISION_BRIDGE_MAX_TOKENS");
 	if (envMax !== undefined) config.maxTokens = envMax;
 	const envCache = envNumber("PI_VISION_BRIDGE_CACHE_MAX");
@@ -126,7 +145,7 @@ export function saveConfig(config: BridgeConfig): { ok: boolean; error?: string 
 export function describeConfig(config: BridgeConfig): string {
 	const lines = [
 		`enabled: ${config.enabled}`,
-		`vision model: ${config.visionModel ?? "auto-select"}`,
+		`vision models: ${config.visionModels ? config.visionModels.join(", ") : "auto-select"}`,
 		`max tokens: ${config.maxTokens}`,
 		`temperature: ${config.temperature}`,
 		`cache cap: ${config.cacheMax}`,

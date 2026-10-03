@@ -166,12 +166,12 @@ await registered.commands.visionbridge.handler(`model ${visionSpec}`, ctx(fakeMo
 const agentDir = join(fakeHome, ".pi", "agent");
 assert.ok(readdirSync(agentDir).includes("pi-vision-bridge.json"), "config file written");
 const saved = JSON.parse(readFileSync(join(agentDir, "pi-vision-bridge.json"), "utf8"));
-assert.equal(saved.visionModel, visionSpec, "config persisted visionModel");
+assert.equal(JSON.stringify(saved.visionModels), JSON.stringify([visionSpec]), "config persisted the ordered visionModels list");
 
 // --- invalid model spec rejected ---
 await registered.commands.visionbridge.handler("model test/no-such-model", ctx(fakeModel(["text"])));
 const after = JSON.parse(readFileSync(join(agentDir, "pi-vision-bridge.json"), "utf8"));
-assert.equal(after.visionModel, visionSpec, "invalid model not persisted");
+assert.equal(JSON.stringify(after.visionModels), JSON.stringify([visionSpec]), "invalid model not persisted");
 
 // --- off / on ---
 await registered.commands.visionbridge.handler("off", ctx(fakeModel(["text"])));
@@ -918,6 +918,173 @@ assert.ok(!("videoDownloadMaxMB" in savedNow), "persisted config never contains 
 notifications.length = 0;
 await registered.commands.visionbridge.handler("status", ctx(fakeModel(["text"])));
 assert.ok(!notifyLines().toLowerCase().includes("download"), "status output never mentions download");
+
+// =====================================================================
+// Simplified model selection: ordered list, no scoring, pi-settings layer
+// =====================================================================
+const { rankVisionModels, resolveVisionModel } = await import("../src/vision.ts");
+
+// --- rankVisionModels: the user's list order is law ---
+const listCtx = {
+	...ctx(fakeModel(["text"])),
+	modelRegistry: {
+		getAvailable: () => [fakeModel(["text", "image"]), fakeModel(["text"])],
+		find: (provider, id) => {
+			if (!id.startsWith("vision")) return undefined;
+			const m = fakeModel(["text", "image"]);
+			m.id = id;
+			return m;
+		},
+		hasConfiguredAuth: () => true,
+		complete: async () => { throw new Error("network should not be reached"); },
+	},
+};
+const modelFor = (id) => {
+	const m = fakeModel(["text", "image"]);
+	m.id = id;
+	return m;
+};
+// a registry whose catalog lists a "pro" model before a "flash" model
+const catalogCtx = {
+	...ctx(fakeModel(["text"])),
+	modelRegistry: {
+		getAvailable: () => [modelFor("routeA/big-pro-vision"), modelFor("routeA/cheap-flash"), modelFor("routeB/mid-vision")],
+		find: (p, id) => modelFor(id),
+		hasConfiguredAuth: () => true,
+		complete: async () => { throw new Error("network should not be reached"); },
+	},
+};
+const autoOrder = rankVisionModels(catalogCtx, null).map((c) => c.model.id);
+assert.deepEqual(
+	autoOrder.slice(0, 3),
+	["routeA/big-pro-vision", "routeA/cheap-flash", "routeB/mid-vision"],
+	"auto mode keeps catalog order (no name scoring)",
+);
+assert.equal(autoOrder.length, 3, "auto pool: 2 per prefix + top-up fills the third");
+const configured = rankVisionModels(listCtx, ["test/vision-model-2", "test/vision-model"]);
+assert.deepEqual(
+	configured.map((c) => c.model.id),
+	["vision-model-2", "vision-model"],
+	"configured list order is preserved exactly",
+);
+assert.equal(configured[0].source, "configured", "source label: configured");
+assert.ok(resolveVisionModel(listCtx, "test/vision-model"), "resolveVisionModel resolves a valid spec");
+assert.equal(resolveVisionModel(listCtx, "bogus"), undefined, "resolveVisionModel rejects a malformed spec");
+assert.equal(
+	rankVisionModels(listCtx, ["test/no-such-model"]).length,
+	0,
+	"unresolvable configured entries are skipped, not fatal",
+);
+
+// --- rotation within a user-ordered list: first entry 503s, second answers ---
+const rotationCaptured = [];
+const rotatingCtx = (failIds) => ({
+	...ctx(fakeModel(["text"])),
+	modelRegistry: {
+		getAvailable: () => [fakeModel(["text", "image"]) ],
+		find: (p, id) => {
+			const m = fakeModel(["text", "image"]);
+			m.id = id;
+			return m;
+		},
+		hasConfiguredAuth: () => true,
+		complete: async (calledModel) => {
+			rotationCaptured.push(calledModel.id);
+			if (failIds.includes(calledModel.id)) throw new Error("503: upstream unavailable");
+			return {
+				role: "assistant",
+				content: [{ type: "text", text: "rotation survived" }],
+				usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 },
+				stopReason: "stop",
+			};
+		},
+	},
+});
+const rotCtx = rotatingCtx(["vision-model"]);
+rotCtx.sessionManager = {
+	getBranch: () => [
+		{ type: "message", message: { role: "user", content: [makeImage("rot-img", [800, 600])], timestamp: 1 } },
+	],
+};
+await registered.commands.visionbridge.handler("model test/vision-model, test/vision-model-2", rotCtx);
+const rotSaved = JSON.parse(readFileSync(join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"), "utf8"));
+assert.deepEqual(rotSaved.visionModels, ["test/vision-model", "test/vision-model-2"], "multi-spec command persists the ordered list");
+rotationCaptured.length = 0;
+const rotResult = await imageTool.execute("rot-1", { question: "anything" }, undefined, undefined, rotCtx);
+assert.ok(rotResult.content[0].text.includes("rotation survived"), "user-ordered list: analysis succeeds");
+assert.deepEqual(
+	rotationCaptured,
+	["vision-model", "vision-model-2"],
+	"first entry failed with 503, second entry answered (in the user's order)",
+);
+// sticky winner: the next call goes straight to the model that answered
+rotationCaptured.length = 0;
+await imageTool.execute("rot-2", { question: "anything again" }, undefined, undefined, rotCtx);
+assert.deepEqual(rotationCaptured, ["vision-model-2"], "sticky winner skips the benched entry");
+
+// --- config in pi's own settings.json (visionBridge section) ---
+await registered.commands.visionbridge.handler("auto", ctx(fakeModel(["text"])));
+writeFileSync(
+	join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"),
+	JSON.stringify({ visionModels: ["test/from-file"] }),
+);
+const piSettingsCtx = (section) => {
+	const c = captureCtx(fakeModel(["text"]));
+	c.modelRegistry = {
+		...c.modelRegistry,
+		find: (provider, id) => {
+			if (!id.startsWith("pi-settings-model")) return undefined;
+			const m = fakeModel(["text", "image"]);
+			m.id = id;
+			return m;
+		},
+		complete: async (calledModel) => {
+			capturedCalls.push({ model: calledModel, context: { messages: [{ role: "user", content: [] }] }, options: {} });
+			return {
+				role: "assistant",
+				content: [{ type: "text", text: "pi settings ok" }],
+				usage: { ...cannedUsage },
+				stopReason: "stop",
+			};
+		},
+	};
+	c.getSettings = () => ({ visionBridge: section });
+	return c;
+};
+const fromSettings = piSettingsCtx({ visionModels: ["test/pi-settings-model"], videoFrames: 7 });
+fromSettings.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [makeImage("pi-cfg")], timestamp: 1 } }],
+};
+capturedCalls.length = 0;
+const piCfgResult = await imageTool.execute("pi-cfg-1", { question: "x" }, undefined, undefined, fromSettings);
+assert.ok(piCfgResult.details.model.includes("pi-settings-model"), "visionBridge section from pi settings selects the model");
+// env still wins over the pi-settings section
+process.env.PI_VISION_BRIDGE_MODEL = "test/pi-settings-model-2";
+const envWins = piSettingsCtx({ visionModels: ["test/pi-settings-model"] });
+envWins.sessionManager = fromSettings.sessionManager;
+const envResult = await imageTool.execute("pi-cfg-2", { question: "y" }, undefined, undefined, envWins);
+assert.ok(envResult.details.model.includes("pi-settings-model-2"), "env var beats the pi-settings section");
+delete process.env.PI_VISION_BRIDGE_MODEL;
+// a section with unknown fields is tolerated
+const tolerated = piSettingsCtx({ visionModels: ["test/pi-settings-model"], bogusKey: "whatever" });
+tolerated.sessionManager = fromSettings.sessionManager;
+const toleratedResult = await imageTool.execute("pi-cfg-3", { question: "z" }, undefined, undefined, tolerated);
+assert.ok(toleratedResult.details.model.includes("pi-settings-model"), "unknown fields in the visionBridge section are ignored");
+// legacy single-model field in the old config file is tolerated
+writeFileSync(
+	join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"),
+	JSON.stringify({ visionModel: "test/legacy-pin" }),
+);
+const legacyConfig = await import("../src/config.ts");
+assert.deepEqual(legacyConfig.loadConfig().visionModels, ["test/legacy-pin"], "legacy visionModel string loads as a one-entry pin");
+// env var list form
+process.env.PI_VISION_BRIDGE_MODEL = "test/a, test/b";
+assert.deepEqual(legacyConfig.loadConfig().visionModels, ["test/a", "test/b"], "env var accepts a comma-separated ordered list");
+delete process.env.PI_VISION_BRIDGE_MODEL;
+// status mentions the pi-settings source when active
+notifications.length = 0;
+await registered.commands.visionbridge.handler("status", piSettingsCtx({ visionModels: ["test/pi-settings-model"] }));
+assert.ok(notifyLines().includes("from pi settings"), "status names the pi-settings source");
 
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });

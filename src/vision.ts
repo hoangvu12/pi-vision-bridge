@@ -66,89 +66,77 @@ export interface AnalyzeOptions {
 }
 
 /**
- * Resolve the RANKED vision-model candidates.
- *
- * Priority: env/config "provider/model-id" (single candidate, no fallback —
- * the user asked for that model) → auto-ranked list among the session's
- * available, authenticated, image-capable models.
- *
- * Auto scoring (lower = better): each cheap-tier name match (flash, mini,
- * nano, haiku, lite, turbo, …) subtracts; vision families with strong OCR
- * track records subtract; reasoning models and expensive models add.
- *
- * The ranked pool is diversified by id-prefix (the first id segment — for
- * relay-style providers that segment is the upstream route): at most two
- * candidates per prefix, so one dead route cannot occupy the whole pool.
+ * Resolve one "provider/model-id" spec to a connected, image-capable model.
+ * Returns undefined when the spec is malformed, unknown, or not vision-capable.
  */
-export function rankVisionModels(ctx: ExtensionContext, configured: string | null): VisionCandidate[] {
+export function resolveVisionModel(ctx: ExtensionContext, spec: string): Model<any> | undefined {
+	const slash = spec.indexOf("/");
+	if (slash <= 0 || slash === spec.length - 1) return undefined;
+	const model = ctx.modelRegistry.find(spec.slice(0, slash), spec.slice(slash + 1));
+	if (!model || !model.input.includes("image") || !ctx.modelRegistry.hasConfiguredAuth(model)) return undefined;
+	return model;
+}
+
+/**
+ * Resolve the ordered vision-model candidates.
+ *
+ * - Configured list: the user's order is law. Candidates are returned in
+ *   exactly that order (one entry = a pinned model with no fallback);
+ *   unresolvable entries are skipped with a debug line, not an error.
+ * - Auto (null): the registry's image-capable, authenticated models in
+ *   catalog order. No quality guessing \u2014 a name says nothing a test has
+ *   verified, so none is scored. The pool is only diversified by id-prefix
+ *   (the first id segment is the upstream route for relay-style providers):
+ *   at most two candidates per prefix so one dead route cannot occupy the
+ *   whole pool. That is availability insurance, not a ranking.
+ *
+ * Either way, health rotation (benching, sticky winner) applies on top.
+ */
+export function rankVisionModels(ctx: ExtensionContext, configured: string[] | null): VisionCandidate[] {
 	const registry = ctx.modelRegistry;
 
-	if (configured) {
-		const slash = configured.indexOf("/");
-		if (slash <= 0 || slash === configured.length - 1) return [];
-		const model = registry.find(configured.slice(0, slash), configured.slice(slash + 1));
-		if (!model || !model.input.includes("image") || !registry.hasConfiguredAuth(model)) return [];
-		return [{ model, source: process.env.PI_IMAGE_BRIDGE_MODEL ? "env" : "configured", rank: 0 }];
+	if (configured && configured.length > 0) {
+		const fromEnv = !!process.env.PI_VISION_BRIDGE_MODEL;
+		const candidates: VisionCandidate[] = [];
+		for (const spec of configured) {
+			const model = resolveVisionModel(ctx, spec);
+			if (model) {
+				candidates.push({ model, source: fromEnv ? "env" : "configured", rank: candidates.length });
+			} else {
+				debug("configured vision model not found or not image-capable, skipping:", spec);
+			}
+		}
+		return candidates;
 	}
 
-	const candidates = registry
+	const models = registry
 		.getAvailable()
 		.filter((m) => m.input.includes("image") && registry.hasConfiguredAuth(m));
 
-	const scored = candidates
-		.map((model) => ({ model, score: autoPickScore(model) }))
-		.sort((a, b) => (a.score - b.score) || a.model.id.localeCompare(b.model.id));
-
 	// Diversify: at most two per id prefix (upstream route), then fill up.
-	const pool: typeof scored = [];
+	const pool: typeof models = [];
 	const perPrefix = new Map<string, number>();
 	const MAX_PER_PREFIX = 2;
 	const POOL_SIZE = 10;
-	for (const entry of scored) {
-		const prefix = entry.model.id.split("/")[0] ?? entry.model.id;
+	for (const model of models) {
+		const prefix = model.id.split("/")[0] ?? model.id;
 		const count = perPrefix.get(prefix) ?? 0;
 		if (count >= MAX_PER_PREFIX) continue;
 		perPrefix.set(prefix, count + 1);
-		pool.push(entry);
+		pool.push(model);
 		if (pool.length >= POOL_SIZE) break;
 	}
 	// Top-up if diversity cut the pool short.
-	for (const entry of scored) {
+	for (const model of models) {
 		if (pool.length >= POOL_SIZE) break;
-		if (!pool.includes(entry)) pool.push(entry);
+		if (!pool.includes(model)) pool.push(model);
 	}
 
 	if (process.env.PI_IMAGE_BRIDGE_DEBUG === "1" && pool.length > 0) {
-		debug("vision candidates:", pool.map((s) => `${s.model.id}(${s.score})`).join(", "));
+		debug("vision candidates:", pool.map((m) => m.id).join(", "));
 	}
 
-	return pool.map((s, i) => ({ model: s.model, source: "auto" as const, rank: i }));
-}
-
-const CHEAP_TIERS = /(^|[^a-z])(flash|mini|nano|haiku|lite|instant|turbo|fast|spark|air)([^a-z]|$)/g;
-const VISION_FAMILIES = /(gemini|gpt-4\.1|gpt-5|qwen|glm|vl|pixtral|minimax|moondream|llama|internvl|step)/i;
-
-function autoPickScore(m: Model<any>): number {
-	let score = 0;
-	const name = `${m.provider}/${m.id} ${m.name ?? ""}`.toLowerCase();
-
-	// Reasoning models burn time and tokens on thinking for a caption task.
-	if (m.reasoning) score += 2;
-
-	// Every cheap/fast tier word in the name is a signal (flash-lite beats flash).
-	const tiers = name.match(CHEAP_TIERS);
-	if (tiers) score -= 3 * Math.min(tiers.length, 2);
-
-	// Vision families with good OCR track records.
-	if (VISION_FAMILIES.test(name)) score -= 1;
-
-	// Price heuristics ($ per million input tokens).
-	const input = m.cost?.input ?? 1;
-	if (input === 0) score -= 2;
-	else if (input <= 1) score -= 1;
-	else if (input >= 10) score += 2;
-
-	return score;
+	return pool.map((model, i) => ({ model, source: "auto" as const, rank: i }));
 }
 
 /** Should a failed analysis be retried against a different candidate? */

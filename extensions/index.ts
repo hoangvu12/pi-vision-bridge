@@ -39,12 +39,14 @@
  *     can watch video natively.
  *
  *  BOTH
- *  7. Vision model auto-selection from the session's connected models
- *     (flash/nano/haiku tier preferred), as a RANKED candidate list with
- *     health tracking: failed models are benched for a cooldown and the
- *     analysis rotates to the next candidate (a relay listing a model says
- *     nothing about its upstream actually serving it). Override with
- *     /visionbridge model, config file, or env var.
+ *  7. Vision-model selection as an ORDERED candidate list with health
+ *     tracking: failed models are benched for a cooldown and the analysis
+ *     rotates to the next entry; the winner sticks (a relay listing a model
+ *     says nothing about its upstream actually serving it). No name-based
+ *     scoring — a model name says nothing a test verified, so auto mode
+ *     uses catalog order and the user can set an explicit order via
+ *     /visionbridge model, the config file, the visionBridge section in
+ *     pi's own settings (global or project), or an env var.
  *  8. Passthrough with zero overhead when the active model supports images.
  *  9. The helper vision call is a plain no-tools model call: the media and
  *     a fixed prompt only — never tools, files, or bash, so hostile media
@@ -69,6 +71,7 @@ import {
 	analyzeImage,
 	analyzeImages,
 	fingerprint,
+	resolveVisionModel,
 	HEALTH_COOLDOWN_MS,
 	isRetryableFailure,
 	MAX_ATTEMPTS,
@@ -135,7 +138,68 @@ const VIDEO_GLOB_RE = /(?:[A-Za-z]:)?[\w\-./\\@+()\[\]]+\.(?:mp4|mov|mkv|m4v|web
 const VIDEO_QUOTED_RE = /["']([^"']+\.(?:mp4|mov|mkv|m4v|webm|avi))["']/gi;
 
 export default function visionBridge(pi: ExtensionAPI) {
-	let config = isEnvDisabled() ? { ...loadConfig(), enabled: false } : loadConfig();
+	/** Env var per config field: env always wins over the pi-settings section. */
+	const FIELD_ENV: Partial<Record<keyof BridgeConfig, string>> = {
+		enabled: "PI_VISION_BRIDGE_OFF",
+		visionModels: "PI_VISION_BRIDGE_MODEL",
+		maxTokens: "PI_VISION_BRIDGE_MAX_TOKENS",
+		cacheMax: "PI_VISION_BRIDGE_CACHE_MAX",
+		videoFrames: "PI_VISION_BRIDGE_VIDEO_FRAMES",
+	};
+
+	/**
+	 * pi's settings.json has no official per-extension section, but unknown
+	 * keys survive its loader and deep merge, and getSettings() exposes the
+	 * merged result. So an optional "visionBridge" block (global AND project
+	 * scope; project wins via pi's own merge) is honored as a config layer.
+	 * Unknown keys inside the block are ignored, never rejected.
+	 */
+	type SettingsLike = { getSettings?: () => unknown };
+	function readPiSection(source: unknown): Partial<BridgeConfig> | undefined {
+		const getter = (source as SettingsLike | undefined)?.getSettings;
+		if (typeof getter !== "function") return undefined;
+		try {
+			const settings = (getter as () => unknown)() as { visionBridge?: Record<string, unknown> } | undefined;
+			const raw = settings?.visionBridge;
+			if (!raw || typeof raw !== "object") return undefined;
+			const out: Partial<BridgeConfig> = {};
+			if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+			if (Array.isArray(raw.visionModels)) {
+				const list = raw.visionModels
+					.filter((s): s is string => typeof s === "string")
+					.map((s) => s.trim())
+					.filter((s) => s.length > 0);
+				if (list.length > 0) out.visionModels = list;
+			}
+			if (typeof raw.maxTokens === "number" && raw.maxTokens > 0) out.maxTokens = raw.maxTokens;
+			if (typeof raw.temperature === "number" && raw.temperature >= 0) out.temperature = raw.temperature;
+			if (typeof raw.cacheMax === "number" && raw.cacheMax > 0) out.cacheMax = raw.cacheMax;
+			if (typeof raw.notify === "boolean") out.notify = raw.notify;
+			if (typeof raw.videoFrames === "number" && raw.videoFrames > 0) out.videoFrames = raw.videoFrames;
+			return out;
+		} catch (err) {
+			debug("pi settings read failed:", err instanceof Error ? err.message : err);
+			return undefined;
+		}
+	}
+
+	/** Effective config: defaults <- file <- pi-settings section <- env. */
+	function buildConfig(source: unknown): BridgeConfig {
+		const base = isEnvDisabled() ? { ...loadConfig(), enabled: false } : loadConfig();
+		const section = readPiSection(source);
+		piSettingsActive = section !== undefined && Object.keys(section).length > 0;
+		if (!section) return base;
+		const next = { ...base };
+		for (const [key, value] of Object.entries(section) as Array<[keyof BridgeConfig, unknown]>) {
+			const envVar = FIELD_ENV[key];
+			if (envVar && process.env[envVar] !== undefined) continue; // env wins
+			(next as Record<string, unknown>)[key] = value;
+		}
+		return next;
+	}
+
+	let piSettingsActive = false; // set by buildConfig; true when a visionBridge section applied
+	let config = buildConfig(pi);
 
 	// LRU cache: key -> description. Map preserves insertion order.
 	const cache = new Map<string, CacheEntry>();
@@ -152,8 +216,8 @@ export default function visionBridge(pi: ExtensionAPI) {
 	let notifiedAutoPick = false;
 	let lastNotifyKey = "";
 
-	function refreshConfig(): void {
-		config = isEnvDisabled() ? { ...loadConfig(), enabled: false } : loadConfig();
+	function refreshConfig(ctx: ExtensionContext): void {
+		config = buildConfig(ctx);
 	}
 
 	function cacheGet(hash: string): CacheEntry | undefined {
@@ -205,11 +269,11 @@ export default function visionBridge(pi: ExtensionAPI) {
 	function getVisionCandidates(ctx: ExtensionContext): VisionCandidate[] {
 		if (!config.enabled) return [];
 		const now = Date.now();
-		const modelKey = config.visionModel ?? "";
+		const modelKey = config.visionModels?.join(",") ?? "";
 		if (visionMemo && now - visionMemo.at < 30_000 && visionMemo.key === modelKey) {
 			return applyHealth(visionMemo.candidates);
 		}
-		const candidates = rankVisionModels(ctx, config.visionModel);
+		const candidates = rankVisionModels(ctx, config.visionModels);
 		visionMemo = { candidates, at: now, key: modelKey };
 
 		if (candidates.length === 0) {
@@ -626,7 +690,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<ToolResult> {
-			refreshConfig();
+			refreshConfig(ctx);
 			if (!config.enabled) {
 				return {
 					content: [{ type: "text", text: "pi-vision-bridge is disabled. Images cannot be examined." }],
@@ -898,7 +962,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<ToolResult> {
-			refreshConfig();
+			refreshConfig(ctx);
 			if (!config.enabled) {
 				return {
 					content: [{ type: "text", text: "pi-vision-bridge is disabled. Images cannot be compared." }],
@@ -1014,7 +1078,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 		}),
 
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<ToolResult> {
-			refreshConfig();
+			refreshConfig(ctx);
 			if (!config.enabled) {
 				return {
 					content: [{ type: "text", text: "pi-vision-bridge is disabled. Videos cannot be examined." }],
@@ -1156,7 +1220,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		refreshConfig();
+		refreshConfig(ctx);
 		syncToolVisibility(ctx);
 	});
 
@@ -1175,6 +1239,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 			return filtered.length > 0 ? filtered.map((s) => ({ value: s, label: s })) : null;
 		},
 		handler: async (args, ctx) => {
+			refreshConfig(ctx); // status reflects the current file + pi-settings section
 			const parts = args.trim().split(/\s+/).filter(Boolean);
 			const [sub, ...rest] = parts;
 
@@ -1186,13 +1251,16 @@ export default function visionBridge(pi: ExtensionAPI) {
 					const lines = [
 						"pi-vision-bridge status",
 						`enabled: ${config.enabled}`,
-						`vision models (ranked, healthy): ${
+						`vision models (ordered, healthy): ${
 							candidates.length > 0
 								? candidates.slice(0, 3).map(candidateKey).join(", ")
-								: config.visionModel
+								: config.visionModels
 									? "configured but unavailable"
 									: "none available"
 						}`,
+						`vision models config: ${
+							config.visionModels ? config.visionModels.join(", ") : "auto (catalog order)"
+						}${piSettingsActive ? " [from pi settings visionBridge section]" : ""}`,
 						`active model: ${model ? `${model.provider}/${model.id} (${model.input.includes("image") ? "vision — images pass through, video still needs the tool" : "text-only — bridge active"})` : "none"}`,
 						`tools: image ${pi.getActiveTools().includes(IMAGE_TOOL) ? "visible" : "hidden"}, video ${pi.getActiveTools().includes(VIDEO_TOOL) ? "visible" : "hidden"}, compare ${pi.getActiveTools().includes(COMPARE_TOOL) ? "visible" : "hidden"}`,
 						`cache: ${cache.size} entr${cache.size === 1 ? "y" : "ies"} (cap ${config.cacheMax})`,
@@ -1205,34 +1273,44 @@ export default function visionBridge(pi: ExtensionAPI) {
 				}
 
 				case "model": {
-					const spec = rest.join(" ").trim();
-					if (!spec || !spec.includes("/") || spec.indexOf("/") === 0 || spec.endsWith("/")) {
-						ctx.ui.notify("Usage: /visionbridge model provider/model-id (e.g. google/gemini-2.5-flash)", "warning");
+					// One spec pins a single model (no fallback); several specs
+					// (space or comma separated) give an ordered fallback list.
+					const specs = rest
+						.join(" ")
+						.split(/[,\s]+/)
+						.map((s) => s.trim())
+						.filter(Boolean);
+					if (specs.length === 0 || specs.some((s) => !s.includes("/") || s.indexOf("/") === 0 || s.endsWith("/"))) {
+						ctx.ui.notify(
+							"Usage: /visionbridge model provider/model-id [provider/model-id …] — one model pins it, several set an ordered fallback list.",
+							"warning",
+						);
 						return;
 					}
-					const probe = rankVisionModels(ctx, spec);
-					if (probe.length === 0) {
+					const bad = specs.filter((spec) => !resolveVisionModel(ctx, spec));
+					if (bad.length > 0) {
 						ctx.ui.notify(
-							`"${spec}" is not a connected vision-capable model. Check /models or use a provider/model-id you can authenticate.`,
+							`${bad.map((s) => `"${s}"`).join(", ")} ${bad.length === 1 ? "is" : "are"} not connected vision-capable model(s). Check /models or use provider/model-id values you can authenticate.`,
 							"error",
 						);
 						return;
 					}
-					config = { ...config, visionModel: spec };
+					config = { ...config, visionModels: specs };
 					const saved = saveConfig(config);
 					visionMemo = undefined;
 					syncToolVisibility(ctx);
 					ctx.ui.notify(
 						saved.ok
-							? `Vision model set to ${spec}.`
-							: `Vision model set to ${spec} for this session (config write failed: ${saved.error}).`,
-						saved.ok ? "info" : "warning",
+							? `Vision model${specs.length > 1 ? "s" : ""} set to ${specs.join(", ")}${specs.length > 1 ? " (ordered, with fallback)" : " (pinned, no fallback)"}.`
+							: `Vision model${specs.length > 1 ? "s" : ""} set for this session (config write failed: ${saved.error}).` +
+									(piSettingsActive ? " NOTE: a visionBridge section in pi settings overrides this file." : ""),
+						saved.ok && !piSettingsActive ? "info" : "warning",
 					);
 					return;
 				}
 
 				case "auto": {
-					config = { ...config, visionModel: null };
+					config = { ...config, visionModels: null };
 					const saved = saveConfig(config);
 					visionMemo = undefined;
 					const candidates = getVisionCandidates(ctx);
