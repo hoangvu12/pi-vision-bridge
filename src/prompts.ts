@@ -149,6 +149,31 @@ export function resolveModePrompt(mode: AnalysisMode, question?: string): ModePr
 	};
 }
 
+/** System prompt for two-image comparison (diff-oriented reading). */
+export const COMPARE_SYSTEM_PROMPT = `You are the vision stage of a coding assistant that cannot view images directly. Another language model — not a human — will read your output as its only view of the images.
+
+You are given TWO images to compare — usually two versions or states of the same screen, page, or picture. The user text names which is the FIRST image and which is the SECOND. Produce one complete, standalone comparison:
+
+1. DIFFERENCES: what changed between the FIRST image and the SECOND image — text (added, removed, or reworded), values, positions, layout, colors, and UI state (selected, enabled, disabled, loading, error). For every difference, attribute it: what one image shows and what the other shows instead, e.g. "image a1b2 shows '3 errors'; image c3d4 shows 'all checks passed'".
+2. WHAT STAYED THE SAME: the stable context — overall layout, unchanged regions, shared text — briefly.
+3. PRECISION: transcribe any text you cite verbatim; mark uncertain characters with "‹?›"; never invent details. If a region is too small or blurry to compare reliably, say so.
+
+Rules:
+- Describe only what is visible. Mark inferences as uncertain.
+- Plain text/markdown only. No preamble, no advice, no questions.
+- Refer to the images by the short ids the user text gives them — never by position ("the left one").`;
+
+/** User text for a comparison call; fingerprints name the images so the
+ *  cached description stays correct regardless of call order. */
+export function buildCompareUserText(first: string, second: string, question?: string): string {
+	return (
+		`The FIRST image is ${first}; the SECOND image is ${second}. Compare them: describe what differs ` +
+		`(text, layout, state, color), what stayed the same, and which image each difference belongs to. ` +
+		`Refer to them as "image ${first}" and "image ${second}".` +
+		(question ? `\n\nFocus on: ${question}` : "")
+	);
+}
+
 /** Spec for the wrapper text that replaces an image for text-only models. */
 export interface SwapTextSpec {
 	/** Short fingerprint id of the image, as shown to the model. */

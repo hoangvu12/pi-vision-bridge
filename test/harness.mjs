@@ -682,6 +682,102 @@ assert.equal(
 const leftovers = readdirSync(tmpdir()).filter((d) => d.startsWith("pi-vision-bridge-"));
 assert.equal(leftovers.length, 0, "no crop/frame temp dirs left behind");
 
+// =====================================================================
+// Ticket 04: compare_images tool
+// =====================================================================
+const compareTool = registered.tools.find((t) => t.name === "compare_images");
+assert.ok(compareTool, "compare_images registered");
+assert.deepEqual(compareTool.parameters.required ?? [], [], "compare_images: nothing required");
+assert.ok(Value.Check(compareTool.parameters, {}), "compare schema accepts empty params");
+assert.ok(/compar/i.test(compareTool.promptSnippet), "prompt snippet advertises comparison");
+
+const cmpA = { type: "image", data: Buffer.from("cmp-a").toString("base64"), mimeType: "image/png" };
+const cmpB = { type: "image", data: Buffer.from("cmp-b").toString("base64"), mimeType: "image/png" };
+const cmpC = { type: "image", data: Buffer.from("cmp-c").toString("base64"), mimeType: "image/png" };
+const fpOf = (img) => createHash("sha256").update(img.mimeType).update(":").update(img.data).digest("hex").slice(0, 10);
+const threeCtx = captureCtx(fakeModel(["text"]));
+threeCtx.sessionManager = {
+	getBranch: () => [
+		{ type: "message", message: { role: "user", content: [cmpA], timestamp: 1 } },
+		{ type: "message", message: { role: "user", content: [cmpB], timestamp: 2 } },
+		{ type: "message", message: { role: "user", content: [cmpC], timestamp: 3 } },
+	],
+};
+
+// --- default pair: the two most recent distinct images, one call ---
+capturedCalls.length = 0;
+const cmpResult = await compareTool.execute("cmp1", {}, undefined, undefined, threeCtx);
+assert.equal(capturedCalls.length, 1, "one model call for the comparison");
+const sentImages = imageBlocks(lastCall());
+assert.equal(sentImages.length, 2, "both images in ONE request");
+assert.equal(sentImages[0].data, cmpB.data, "first slot = second-most-recent image");
+assert.equal(sentImages[1].data, cmpC.data, "second slot = most recent image");
+assert.ok(/differ|chang/i.test(lastCall().context.systemPrompt), "diff-oriented system prompt");
+assert.ok(/FIRST image/i.test(textBlocks(lastCall())[0].text), "prompt names the first image");
+assert.ok(textBlocks(lastCall())[0].text.includes(fpOf(cmpC)), "prompt references fingerprints");
+assert.ok(cmpResult.content[0].text.includes(`Compared image ${fpOf(cmpB)}`), "result names the pair");
+assert.ok(cmpResult.content[0].text.includes(cannedDescription), "result carries the comparison");
+assert.deepEqual(cmpResult.usage, cannedUsage, "nested usage reported");
+
+// --- cache: pair is order-insensitive ---
+const cmpAgain = await compareTool.execute("cmp2", {}, undefined, undefined, threeCtx);
+assert.equal(capturedCalls.length, 1, "same pair asked again: cache hit");
+assert.equal(cmpAgain.details.cached, true, "cache hit flagged");
+const reversed = await compareTool.execute("cmp3", { first: fpOf(cmpC), second: fpOf(cmpB) }, undefined, undefined, threeCtx);
+assert.equal(capturedCalls.length, 1, "reversed pair order: also a cache hit");
+assert.equal(reversed.details.cached, true, "reversed hit flagged");
+assert.ok(
+	reversed.content[0].text.includes(`Compared image ${fpOf(cmpC)}`),
+	"reversed hit recomposes the pair mapping",
+);
+
+// --- explicit pair + question ---
+capturedCalls.length = 0;
+await compareTool.execute(
+	"cmp4",
+	{ first: fpOf(cmpA), second: fpOf(cmpC), question: "did the banner change" },
+	undefined,
+	undefined,
+	threeCtx,
+);
+assert.equal(imageBlocks(lastCall())[0].data, cmpA.data, "explicit first");
+assert.equal(imageBlocks(lastCall())[1].data, cmpC.data, "explicit second");
+assert.ok(textBlocks(lastCall())[0].text.includes("did the banner change"), "question folded into the compare prompt");
+
+// --- one explicit + one defaulted ---
+capturedCalls.length = 0;
+await compareTool.execute("cmp5", { first: fpOf(cmpA) }, undefined, undefined, threeCtx);
+assert.equal(imageBlocks(lastCall())[0].data, cmpA.data, "explicit first kept");
+assert.equal(imageBlocks(lastCall())[1].data, cmpC.data, "omitted second defaults to the most recent distinct");
+
+// --- helpful errors ---
+const oneCtx = captureCtx(fakeModel(["text"]));
+oneCtx.sessionManager = { getBranch: () => [{ type: "message", message: { role: "user", content: [cmpA], timestamp: 1 } }] };
+const oneImage = await compareTool.execute("cmp6", {}, undefined, undefined, oneCtx);
+assert.match(oneImage.content[0].text, /distinct image/i, "single-image session: helpful error");
+assert.ok(oneImage.content[0].text.includes(fpOf(cmpA)), "error lists the available image");
+const badFp = await compareTool.execute("cmp7", { first: "zzzzzz" }, undefined, undefined, threeCtx);
+assert.match(badFp.content[0].text, /No image with fingerprint/, "unmatched fingerprint error");
+assert.ok(badFp.content[0].text.includes(fpOf(cmpA)), "error lists available fingerprints");
+const sameFp = await compareTool.execute("cmp8", { first: fpOf(cmpA), second: fpOf(cmpA) }, undefined, undefined, threeCtx);
+assert.match(sameFp.content[0].text, /same image/i, "identical pair rejected");
+
+// --- visibility: compare follows describe_video (all models; hidden only when disabled) ---
+await handlers.session_start[0]({}, ctx(fakeModel(["text", "image"])));
+assert.ok(activeTools.includes("compare_images"), "compare visible for vision models");
+assert.ok(!activeTools.includes("describe_image"), "image tool still hidden for vision models");
+await handlers.model_select[0]({}, ctx(fakeModel(["text"])));
+assert.ok(activeTools.includes("compare_images"), "compare visible for text-only models");
+await registered.commands.visionbridge.handler("off", ctx(fakeModel(["text"])));
+assert.ok(!activeTools.includes("compare_images"), "compare hidden when disabled");
+await registered.commands.visionbridge.handler("on", ctx(fakeModel(["text"])));
+assert.ok(activeTools.includes("compare_images"), "compare back when re-enabled");
+
+// --- status mentions the compare tool ---
+notifications.length = 0;
+await registered.commands.visionbridge.handler("status", ctx(fakeModel(["text"])));
+assert.ok(notifyLines().includes("compare"), "status lists the compare tool");
+
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });
 console.log("ALL HARNESS TESTS PASSED");

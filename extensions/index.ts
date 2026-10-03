@@ -61,6 +61,7 @@ import {
 } from "../src/config.ts";
 import {
 	analyzeImage,
+	analyzeImages,
 	fingerprint,
 	HEALTH_COOLDOWN_MS,
 	isRetryableFailure,
@@ -69,11 +70,20 @@ import {
 	type VisionAnalysis,
 	type VisionCandidate,
 } from "../src/vision.ts";
-import { ANALYSIS_MODES, buildSwapText, IMAGE_TOOL, modesGuidanceList, resolveModePrompt } from "../src/prompts.ts";
+import {
+	ANALYSIS_MODES,
+	buildCompareUserText,
+	buildSwapText,
+	COMPARE_SYSTEM_PROMPT,
+	IMAGE_TOOL,
+	modesGuidanceList,
+	resolveModePrompt,
+} from "../src/prompts.ts";
 import { clampRegion, cropImage, parseImageDimensions, type ImageDimensions, type Region } from "../src/image.ts";
 import { analyzeVideo, probeVideo, VIDEO_EXTENSIONS, videoFingerprint } from "../src/video.ts";
 
 const VIDEO_TOOL = "describe_video";
+const COMPARE_TOOL = "compare_images";
 const VIDEO_HINT_SECTION = "vision_bridge_video";
 
 interface CacheEntry {
@@ -256,6 +266,94 @@ export default function visionBridge(pi: ExtensionAPI) {
 
 		pending.set(hash, job);
 		return job;
+	}
+
+	/** Collect every image present in the persisted session branch, in order. */
+	function collectSessionImages(ctx: ExtensionContext): ImageRef[] {
+		const images: ImageRef[] = [];
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "message") continue;
+			const msg = (entry as { message?: AgentMessage }).message;
+			if (!msg || (msg.role !== "user" && msg.role !== "toolResult")) continue;
+			if (!Array.isArray(msg.content)) continue;
+			for (const block of msg.content) {
+				if (block.type === "image") {
+					images.push({
+						image: block,
+						fingerprint: fingerprint(block),
+						messageRole: msg.role,
+						toolName: msg.role === "toolResult" ? (msg as ToolResultMessage).toolName : undefined,
+					});
+				}
+			}
+		}
+		return images;
+	}
+
+	/** Match a model-supplied fingerprint: exact, or a unique-ish prefix. */
+	function findByFingerprint(images: ImageRef[], wanted: string): ImageRef | undefined {
+		const key = wanted.trim().toLowerCase();
+		return images.find((ref) => ref.fingerprint === key || ref.fingerprint.startsWith(key));
+	}
+
+	/** List the session's images for error messages (retry affordance). */
+	function listImages(images: ImageRef[]): string {
+		return images
+			.map((ref) => `  ${ref.fingerprint} (${ref.messageRole}${ref.toolName ? ` from ${ref.toolName}` : ""})`)
+			.join("\n");
+	}
+
+	/**
+	 * Resolve the (first, second) pair for compare_images. Omitted sides
+	 * default to the most recent image distinct from the resolved other
+	 * side; with both omitted, that is the two most recent distinct images.
+	 */
+	function resolveComparePair(
+		images: ImageRef[],
+		firstSpec: string | undefined,
+		secondSpec: string | undefined,
+	): { ok: true; first: ImageRef; second: ImageRef } | { ok: false; error: string } {
+		// Distinct images, most recent first.
+		const recentDistinct: ImageRef[] = [];
+		const seen = new Set<string>();
+		for (let i = images.length - 1; i >= 0; i--) {
+			const ref = images[i];
+			if (seen.has(ref.fingerprint)) continue;
+			seen.add(ref.fingerprint);
+			recentDistinct.push(ref);
+		}
+
+		const first = firstSpec ? findByFingerprint(images, firstSpec) : undefined;
+		const second = secondSpec ? findByFingerprint(images, secondSpec) : undefined;
+		if ((firstSpec && !first) || (secondSpec && !second)) {
+			return { ok: false, error: `No image with fingerprint "${firstSpec && !first ? firstSpec : secondSpec}". Images in this conversation:
+${listImages(images)}
+Retry with one of these exact fingerprints.` };
+		}
+
+		// The SECOND slot prefers the most recent distinct image (the
+		// "newer" version); the FIRST slot then resolves to the most recent
+		// remaining one — so omitted pair = (earlier, later) of the two most
+		// recent distinct images.
+		const b = second ?? (first ? recentDistinct.find((r) => r.fingerprint !== first.fingerprint) : recentDistinct[0]);
+		const a =
+			first ??
+			(second
+				? recentDistinct.find((r) => r.fingerprint !== second.fingerprint)
+				: recentDistinct.find((r) => r !== b));
+		if (!a || !b) {
+			return {
+				ok: false,
+				error:
+					recentDistinct.length === 1
+						? `Only one distinct image (${recentDistinct[0].fingerprint}) is attached to this conversation; two are needed to compare. Have the user attach or paste another image first.`
+						: "No images are attached to this conversation, so there is nothing to compare.",
+			};
+		}
+		if (a.fingerprint === b.fingerprint) {
+			return { ok: false, error: `Both fingerprints resolve to the same image (${a.fingerprint}); comparing an image with itself is not useful. Choose two different images.` };
+		}
+		return { ok: true, first: a, second: b };
 	}
 
 	/**
@@ -493,23 +591,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 			}
 
 			// Gather images from the session branch (persisted history).
-			const images: ImageRef[] = [];
-			for (const entry of ctx.sessionManager.getBranch()) {
-				if (entry.type !== "message") continue;
-				const msg = (entry as { message?: AgentMessage }).message;
-				if (!msg || (msg.role !== "user" && msg.role !== "toolResult")) continue;
-				if (!Array.isArray(msg.content)) continue;
-				for (const block of msg.content) {
-					if (block.type === "image") {
-						images.push({
-							image: block,
-							fingerprint: fingerprint(block),
-							messageRole: msg.role,
-							toolName: msg.role === "toolResult" ? (msg as ToolResultMessage).toolName : undefined,
-						});
-					}
-				}
-			}
+			const images = collectSessionImages(ctx);
 
 			if (images.length === 0) {
 				return {
@@ -523,17 +605,13 @@ export default function visionBridge(pi: ExtensionAPI) {
 			// Resolve the target image: explicit fingerprint, or the most recent.
 			let target: ImageRef | undefined;
 			if (params.fingerprint) {
-				const wanted = params.fingerprint.trim().toLowerCase();
-				target = images.find((ref) => ref.fingerprint === wanted || ref.fingerprint.startsWith(wanted));
+				target = findByFingerprint(images, params.fingerprint);
 				if (!target) {
-					const available = images
-						.map((ref) => `  ${ref.fingerprint} (${ref.messageRole}${ref.toolName ? ` from ${ref.toolName}` : ""})`)
-						.join("\n");
 					return {
 						content: [
 							{
 								type: "text",
-								text: `No image with fingerprint "${params.fingerprint}". Images in this conversation:\n${available}\nRetry with one of these exact fingerprints.`,
+								text: `No image with fingerprint "${params.fingerprint}". Images in this conversation:\n${listImages(images)}\nRetry with one of these exact fingerprints.`,
 							},
 						],
 						details: { fingerprint: params.fingerprint, model: "", cached: false },
@@ -726,6 +804,130 @@ export default function visionBridge(pi: ExtensionAPI) {
 	});
 
 	/**
+	 * The comparison path: two images, ONE vision call, a diff-oriented
+	 * reading. Visible to every model (like describe_video): even a vision
+	 * model cannot diff two images it was shown in different turns without
+	 * re-attaching them.
+	 */
+	pi.registerTool({
+		name: COMPARE_TOOL,
+		label: "Compare Images",
+		description:
+			"Compare two images from this conversation with a vision model and report what changed between them — " +
+			"text, values, layout, state, color — plus what stayed the same, attributing every difference to the " +
+			"right version. Pass `first` and `second` as the images' fingerprints (from their [Image <fingerprint>] " +
+			"tags); omit both to compare the two most recent distinct images, or omit one to compare the most recent " +
+			"other image. Pass `question` to focus the comparison. Use it after an edit, re-run, or re-render to " +
+			"verify exactly what changed.",
+		promptSnippet: "Compare two images from the conversation — find what changed between them.",
+		parameters: Type.Object({
+			first: Type.Optional(
+				Type.String({
+					description:
+						"The fingerprint of the first image, from its [Image <fingerprint>] tag. Omit to use the most recent distinct image.",
+				}),
+			),
+			second: Type.Optional(
+				Type.String({
+					description:
+						"The fingerprint of the second image, from its [Image <fingerprint>] tag. Omit to use the most recent distinct image other than the first.",
+				}),
+			),
+			question: Type.Optional(
+				Type.String({
+					description:
+						'Focused question about the difference, e.g. "did the error banner disappear" or "which fields changed".',
+				}),
+			),
+		}),
+
+		async execute(_toolCallId, params, _signal, _onUpdate, ctx): Promise<ToolResult> {
+			refreshConfig();
+			if (!config.enabled) {
+				return {
+					content: [{ type: "text", text: "pi-vision-bridge is disabled. Images cannot be compared." }],
+					details: { fingerprint: "", model: "", cached: false },
+				};
+			}
+
+			const images = collectSessionImages(ctx);
+			if (images.length === 0) {
+				return {
+					content: [
+						{ type: "text", text: "No images are attached to this conversation. There is nothing to compare." },
+					],
+					details: { fingerprint: "", model: "", cached: false },
+				};
+			}
+
+			const pair = resolveComparePair(images, params.first, params.second);
+			if (!pair.ok) {
+				return {
+					content: [{ type: "text", text: pair.error }],
+					details: { fingerprint: `${params.first ?? "?"}+${params.second ?? "?"}`, model: "", cached: false },
+					isError: true,
+				};
+			}
+
+			const candidates = getVisionCandidates(ctx);
+			if (candidates.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "No vision-capable model is currently available (every connected candidate failed recently, likely an upstream outage). Tell the user to retry later or connect another vision model.",
+						},
+					],
+					details: { fingerprint: pairKey(pair), model: "", cached: false },
+				};
+			}
+
+			// Cache is keyed on the order-insensitive pair + question: the
+			// same two images asked in either order is one analysis. Only the
+			// model's description is cached; the pair mapping is recomposed
+			// per call so a reversed hit still labels first/second correctly.
+			const cacheKey = `cmp:${JSON.stringify([pair.first.fingerprint, pair.second.fingerprint].sort().concat(params.question ? [params.question] : []))}`;
+			const hit = cacheGet(cacheKey);
+			if (hit) {
+				return {
+					content: [{ type: "text", text: composeCompareText(pair.first, pair.second, hit.description) }],
+					details: { fingerprint: pairKey(pair), model: hit.model, question: params.question, cached: true },
+				};
+			}
+
+			const started = Date.now();
+			const { result } = await runWithFallback(ctx, (model) =>
+				analyzeImages(ctx, model, [pair.first.image, pair.second.image], {
+					prompt: {
+						systemPrompt: COMPARE_SYSTEM_PROMPT,
+						userText: buildCompareUserText(pair.first.fingerprint, pair.second.fingerprint, params.question),
+					},
+					maxTokens: config.maxTokens,
+					temperature: config.temperature,
+				}),
+			);
+			cacheSet(cacheKey, { description: result.description, model: result.model });
+			debug("compared", pairKey(pair), `${Date.now() - started}ms`);
+
+			return {
+				content: [{ type: "text", text: composeCompareText(pair.first, pair.second, result.description) }],
+				// usage from the nested call keeps session statistics accurate.
+				usage: result.usage,
+				details: { fingerprint: pairKey(pair), model: result.model, question: params.question, cached: false },
+			};
+
+			function pairKey(p: { first: ImageRef; second: ImageRef }): string {
+				return [p.first.fingerprint, p.second.fingerprint].sort().join("+");
+			}
+		},
+	});
+
+	/** Header line for a comparison result: maps first/second to fingerprints. */
+	function composeCompareText(first: ImageRef, second: ImageRef, description: string): string {
+		return `Compared image ${first.fingerprint} (first) with image ${second.fingerprint} (second):\n\n${description}`;
+	}
+
+	/**
 	 * The video path: sample frames with ffmpeg, describe them through the
 	 * vision model. Useful for ALL models — pi has no native video input
 	 * anywhere.
@@ -874,21 +1076,30 @@ export default function visionBridge(pi: ExtensionAPI) {
 
 	/**
 	 * Tool visibility: describe_image hides when the active model sees
-	 * natively; describe_video stays visible for every model (pi has no
-	 * native video anywhere).
+	 * natively; describe_video and compare_images stay visible for every
+	 * model (pi has no native video, and a vision model cannot diff two
+	 * images it saw in different turns without re-attaching them).
 	 */
 	function syncToolVisibility(ctx: ExtensionContext): void {
 		const model = ctx.model;
 		const wantImage = config.enabled && !!model && !model.input.includes("image");
 		const wantVideo = config.enabled;
+		const wantCompare = config.enabled;
 		const active = pi.getActiveTools();
 		const hasImage = active.includes(IMAGE_TOOL);
 		const hasVideo = active.includes(VIDEO_TOOL);
-		if (wantImage === hasImage && wantVideo === hasVideo) return;
+		const hasCompare = active.includes(COMPARE_TOOL);
+		if (wantImage === hasImage && wantVideo === hasVideo && wantCompare === hasCompare) return;
 		let next = [...active];
 		next = wantImage ? (hasImage ? next : [...next, IMAGE_TOOL]) : next.filter((n) => n !== IMAGE_TOOL);
 		next = wantVideo ? (hasVideo ? next : [...next, VIDEO_TOOL]) : next.filter((n) => n !== VIDEO_TOOL);
-		debug("tool visibility", `image:${wantImage ? "show" : "hide"}`, `video:${wantVideo ? "show" : "hide"}`);
+		next = wantCompare ? (hasCompare ? next : [...next, COMPARE_TOOL]) : next.filter((n) => n !== COMPARE_TOOL);
+		debug(
+			"tool visibility",
+			`image:${wantImage ? "show" : "hide"}`,
+			`video:${wantVideo ? "show" : "hide"}`,
+			`compare:${wantCompare ? "show" : "hide"}`,
+		);
 		pi.setActiveTools(next);
 	}
 
@@ -931,7 +1142,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 									: "none available"
 						}`,
 						`active model: ${model ? `${model.provider}/${model.id} (${model.input.includes("image") ? "vision — images pass through, video still needs the tool" : "text-only — bridge active"})` : "none"}`,
-						`tools: image ${pi.getActiveTools().includes(IMAGE_TOOL) ? "visible" : "hidden"}, video ${pi.getActiveTools().includes(VIDEO_TOOL) ? "visible" : "hidden"}`,
+						`tools: image ${pi.getActiveTools().includes(IMAGE_TOOL) ? "visible" : "hidden"}, video ${pi.getActiveTools().includes(VIDEO_TOOL) ? "visible" : "hidden"}, compare ${pi.getActiveTools().includes(COMPARE_TOOL) ? "visible" : "hidden"}`,
 						`cache: ${cache.size} entr${cache.size === 1 ? "y" : "ies"} (cap ${config.cacheMax})`,
 						`video frames: ${config.videoFrames}`,
 						`config: ${CONFIG_PATH}`,
