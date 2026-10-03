@@ -1,5 +1,5 @@
 {
-	"name": "pi-vision-bridge",
+	"name": "@hoangnguyenvu12/pi-vision-bridge",
 	"version": "1.0.0",
 	"description": "Give non-vision pi models the ability to understand images AND video: images are described in-context before the request (plus a describe_image tool with task modes and region zoom, and a compare_images diff tool), videos are watched via ffmpeg frame sampling through describe_video. Non-destructive, cached, auto-selects a connected vision model with health-based fallback.",
 	"keywords": [
@@ -24,7 +24,7 @@
 		}
 	},
 	"engines": {
-		"node": ">=20.3"
+		"node": ">=22.19.0"
 	},
 	"pi": {
 		"extensions": [
@@ -48,5 +48,17 @@
 		"@types/node": "^22.10.0",
 		"typebox": "^1.3.34",
 		"typescript": "^5.7.0"
+	},
+	"author": "hoangnguyenvu12",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/hoangvu12/pi-vision-bridge.git"
+	},
+	"bugs": {
+		"url": "https://github.com/hoangvu12/pi-vision-bridge/issues"
+	},
+	"homepage": "https://github.com/hoangvu12/pi-vision-bridge#readme",
+	"publishConfig": {
+		"access": "public"
 	}
 }
