@@ -471,6 +471,217 @@ assert.ok(
 );
 assert.equal(imageBlocks(lastCall()).length, 1, "context swap analyzes one image");
 
+// =====================================================================
+// Ticket 03: dimensions in swap text + region zoom
+// =====================================================================
+const { parseImageDimensions, clampRegion, setCropperForTests } = await import("../src/image.ts");
+import { createRequire } from "node:module";
+const zlib = await import("node:zlib");
+
+// --- header fixtures (independent of the implementation under test) ---
+const makePngHeader = (w, h) => {
+	const b = Buffer.alloc(33);
+	Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(b, 0);
+	b.writeUInt32BE(13, 8);
+	b.write("IHDR", 12, "ascii");
+	b.writeUInt32BE(w, 16);
+	b.writeUInt32BE(h, 20);
+	b[24] = 8; // bit depth
+	b[25] = 6; // color type RGBA
+	b[28] = 0; // interlace
+	return b;
+};
+const makeJpegHeader = (w, h) => {
+	const b = Buffer.alloc(20);
+	b[0] = 0xff;
+	b[1] = 0xd8; // SOI
+	b[2] = 0xff;
+	b[3] = 0xc0; // SOF0
+	b.writeUInt16BE(17, 4);
+	b[6] = 8; // precision
+	b.writeUInt16BE(h, 7);
+	b.writeUInt16BE(w, 9);
+	b[11] = 3; // components
+	return b;
+};
+const makeGifHeader = (w, h) => {
+	const b = Buffer.alloc(10);
+	b.write("GIF89a", 0, "ascii");
+	b.writeUInt16LE(w, 6);
+	b.writeUInt16LE(h, 8);
+	return b;
+};
+const makeWebpHeader = (w, h) => {
+	const b = Buffer.alloc(30);
+	b.write("RIFF", 0, "ascii");
+	b.writeUInt32LE(22, 4);
+	b.write("WEBP", 8, "ascii");
+	b.write("VP8X", 12, "ascii");
+	b.writeUInt32LE(10, 16);
+	// payload: 4 bytes flags at 20, then canvas w-1 and h-1 as 3-byte LE
+	b.writeUIntLE(w - 1, 24, 3);
+	b.writeUIntLE(h - 1, 27, 3);
+	return b;
+};
+
+assert.deepEqual(parseImageDimensions(makePngHeader(800, 600)), { width: 800, height: 600 }, "PNG dims");
+assert.deepEqual(parseImageDimensions(makeJpegHeader(1024, 768)), { width: 1024, height: 768 }, "JPEG dims");
+assert.deepEqual(parseImageDimensions(makeGifHeader(320, 200)), { width: 320, height: 200 }, "GIF dims");
+assert.deepEqual(parseImageDimensions(makeWebpHeader(640, 480)), { width: 640, height: 480 }, "WebP dims");
+assert.equal(parseImageDimensions(Buffer.from("hello world, not an image at all")), undefined, "unknown format: no dims");
+assert.equal(parseImageDimensions(Buffer.from("")), undefined, "empty buffer: no dims");
+const testImageBytes = readFileSync(join(import.meta.dirname, "..", "test-image.png"));
+assert.deepEqual(parseImageDimensions(testImageBytes), { width: 442, height: 860 }, "repo test image dims");
+
+// --- swap text publishes dimensions + region affordance ---
+capturedCalls.length = 0;
+const pngDimMessages = [{ role: "user", content: [{ type: "image", data: makePngHeader(800, 600).toString("base64"), mimeType: "image/png" }], timestamp: 1 }];
+const pngSwap = await handlers.context[0]({ type: "context", messages: structuredClone(pngDimMessages) }, captureCtx(fakeModel(["text"])));
+assert.ok(pngSwap.messages[0].content[0].text.includes("800x600 px; "), "PNG dims in swap text");
+assert.ok(/region \[x, y, w, h\]/.test(pngSwap.messages[0].content[0].text), "region affordance when dims known");
+const jpegDimMessages = [{ role: "user", content: [{ type: "image", data: makeJpegHeader(320, 240).toString("base64"), mimeType: "image/jpeg" }], timestamp: 1 }];
+const jpegSwap = await handlers.context[0]({ type: "context", messages: structuredClone(jpegDimMessages) }, captureCtx(fakeModel(["text"])));
+assert.ok(jpegSwap.messages[0].content[0].text.includes("320x240 px; "), "JPEG dims in swap text");
+const unknownImageMessages = [
+	{ role: "user", content: [{ type: "image", data: Buffer.from("binary-garbage").toString("base64"), mimeType: "application/octet-stream" }], timestamp: 1 },
+];
+const unknownSwap = await handlers.context[0](
+	{ type: "context", messages: structuredClone(unknownImageMessages) },
+	captureCtx(fakeModel(["text"])),
+);
+assert.ok(unknownSwap.messages[0].content[0].text.startsWith("[Image "), "unknown format still swapped (no failure)");
+assert.ok(!unknownSwap.messages[0].content[0].text.includes(" px;"), "no dimensions line for unknown format");
+assert.ok(!/region \[x, y, w, h\]/.test(unknownSwap.messages[0].content[0].text), "no region affordance without dims");
+
+// --- region clamping ---
+assert.deepEqual(
+	clampRegion([700, 500, 200, 200], { width: 800, height: 600 }),
+	{ region: { x: 700, y: 500, w: 100, h: 100 }, clamped: true },
+	"clamp: box exceeding bottom-right",
+);
+assert.deepEqual(
+	clampRegion([-10, -10, 100, 100], { width: 800, height: 600 }),
+	{ region: { x: 0, y: 0, w: 100, h: 100 }, clamped: true },
+	"clamp: negative origin",
+);
+assert.deepEqual(
+	clampRegion([0, 0, 50, 50], { width: 800, height: 600 }),
+	{ region: { x: 0, y: 0, w: 50, h: 50 }, clamped: false },
+	"in-bounds box untouched",
+);
+
+// --- region analysis with the crop step stubbed at the seam ---
+const stubbedRegions = [];
+setCropperForTests(async (image, region) => {
+	stubbedRegions.push(region);
+	return { type: "image", data: Buffer.from("cropped-by-stub").toString("base64"), mimeType: "image/png" };
+});
+const regionImage = { type: "image", data: makePngHeader(800, 600).toString("base64"), mimeType: "image/png" };
+const regionCtx = captureCtx(fakeModel(["text"]));
+regionCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [regionImage], timestamp: 1 } }],
+};
+capturedCalls.length = 0;
+const clampedResult = await imageTool.execute("r1", { region: [700, 500, 200, 200] }, undefined, undefined, regionCtx);
+assert.deepEqual(stubbedRegions.at(-1), { x: 700, y: 500, w: 100, h: 100 }, "cropper receives the clamped box");
+assert.equal(imageBlocks(lastCall()).length, 1, "region analysis sends exactly one image block");
+assert.equal(
+	imageBlocks(lastCall())[0].data,
+	Buffer.from("cropped-by-stub").toString("base64"),
+	"the crop (not the original) is what the model sees",
+);
+assert.ok(clampedResult.content[0].text.includes("Region [700, 500, 100, 100]"), "result states the analyzed region");
+assert.ok(/clamped from \[700, 500, 200, 200\]/.test(clampedResult.content[0].text), "result notes the clamping");
+assert.deepEqual(clampedResult.details.region, [700, 500, 100, 100], "details record the clamped region");
+const inBoundsResult = await imageTool.execute("r2", { region: [10, 20, 100, 50] }, undefined, undefined, regionCtx);
+assert.ok(inBoundsResult.content[0].text.includes("Region [10, 20, 100, 50]"), "in-bounds region stated");
+assert.ok(!inBoundsResult.content[0].text.includes("clamped"), "no clamp note when nothing changed");
+
+// --- zero/negative-area and malformed regions are clear errors ---
+const zeroArea = await imageTool.execute("r3", { region: [0, 0, 0, 50] }, undefined, undefined, regionCtx);
+assert.equal(zeroArea.isError, true, "zero-area region: error result");
+assert.match(zeroArea.content[0].text, /zero or negative area/i, "zero-area error message");
+const negArea = await imageTool.execute("r4", { region: [5, 5, -10, 10] }, undefined, undefined, regionCtx);
+assert.equal(negArea.isError, true, "negative-area region: error result");
+const fullyOutside = await imageTool.execute("r5", { region: [900, 700, 50, 50] }, undefined, undefined, regionCtx);
+assert.equal(fullyOutside.isError, true, "region entirely outside the image: error after clamping");
+assert.match(fullyOutside.content[0].text, /outside the image/i, "outside-image error message");
+const malformed = await imageTool.execute("r6", { region: [1, 2, 3] }, undefined, undefined, regionCtx);
+assert.equal(malformed.isError, true, "malformed region: error result");
+assert.match(malformed.content[0].text, /\[x, y, w, h\]/, "malformed region error explains the shape");
+const noDimsCtx = captureCtx(fakeModel(["text"]));
+noDimsCtx.sessionManager = {
+	getBranch: () => [
+		{ type: "message", message: { role: "user", content: [unknownImageMessages[0].content[0]], timestamp: 1 } },
+	],
+};
+const unparseable = await imageTool.execute("r7", { region: [0, 0, 10, 10] }, undefined, undefined, noDimsCtx);
+assert.equal(unparseable.isError, true, "unparseable dims: error result");
+assert.match(unparseable.content[0].text, /dimensions/i, "unparseable dims error message");
+
+// --- region param schema ---
+const regionParam = imageTool.parameters.properties.region;
+assert.ok(regionParam, "region parameter present");
+assert.ok(Value.Check(regionParam, [1, 2, 3, 4]), "region schema accepts [x, y, w, h]");
+assert.ok(!Value.Check(regionParam, [1, 2, 3]), "region schema rejects a 3-tuple");
+assert.ok(!Value.Check(regionParam, "0,0,10,10"), "region schema rejects strings");
+assert.ok(/\[x, y, w, h\]/.test(imageTool.description), "tool description documents region");
+
+// --- cache key includes region ---
+// distinct valid header (different fingerprint) -> clean cache slate
+const regionCacheImage = { type: "image", data: makePngHeader(640, 480).toString("base64"), mimeType: "image/png" };
+const regionCacheCtx = captureCtx(fakeModel(["text"]));
+regionCacheCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [regionCacheImage], timestamp: 1 } }],
+};
+capturedCalls.length = 0;
+await imageTool.execute("rc1", { region: [10, 20, 100, 50] }, undefined, undefined, regionCacheCtx);
+await imageTool.execute("rc2", { region: [10, 20, 100, 50] }, undefined, undefined, regionCacheCtx);
+assert.equal(capturedCalls.length, 1, "same region twice: one call");
+await imageTool.execute("rc3", { region: [30, 40, 100, 50] }, undefined, undefined, regionCacheCtx);
+assert.equal(capturedCalls.length, 2, "different region: separate analysis");
+await imageTool.execute("rc4", {}, undefined, undefined, regionCacheCtx);
+assert.equal(capturedCalls.length, 3, "no-region analysis never aliases a region entry");
+
+// --- real cropping against the repo's test image (end-to-end mechanics) ---
+setCropperForTests(undefined);
+const realImage = { type: "image", data: testImageBytes.toString("base64"), mimeType: "image/png" };
+const realCtx = captureCtx(fakeModel(["text"]));
+realCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [realImage], timestamp: 1 } }],
+};
+capturedCalls.length = 0;
+const realCrop = await imageTool.execute("real-crop", { region: [10, 20, 200, 300], question: "describe this crop" }, undefined, undefined, realCtx);
+const sent = imageBlocks(lastCall())[0];
+assert.equal(sent.mimeType, "image/png", "crop sent as PNG");
+const sentBytes = Buffer.from(sent.data, "base64");
+assert.deepEqual(parseImageDimensions(sentBytes), { width: 200, height: 300 }, "model receives a 200x300 crop");
+// independent structural check: inflate the IDAT stream, expect (w*4+1)*h bytes (RGBA + filter byte)
+{
+	const chunks = [];
+	let off = 8;
+	while (off + 8 <= sentBytes.length) {
+		const len = sentBytes.readUInt32BE(off);
+		const type = sentBytes.toString("ascii", off + 4, off + 8);
+		if (type === "IDAT") chunks.push(sentBytes.subarray(off + 8, off + 8 + len));
+		if (type === "IEND") break;
+		off += 12 + len;
+	}
+	const inflated = zlib.inflateSync(Buffer.concat(chunks));
+	assert.equal(inflated.length, (200 * 4 + 1) * 300, "crop is a structurally valid PNG scanline stream");
+}
+assert.ok(realCrop.content[0].text.includes("Region [10, 20, 200, 300]"), "e2e result names the region");
+assert.ok(realCrop.content[0].text.includes(cannedDescription), "e2e result carries the description");
+assert.ok(textBlocks(lastCall())[0].text.includes("describe this crop"), "question reaches the region analysis");
+const fullImageResult = await imageTool.execute("real-full", { region: [0, 0, 442, 860] }, undefined, undefined, realCtx);
+assert.equal(
+	imageBlocks(lastCall())[0].data,
+	realImage.data,
+	"full-image region passes the original image through",
+);
+const leftovers = readdirSync(tmpdir()).filter((d) => d.startsWith("pi-vision-bridge-"));
+assert.equal(leftovers.length, 0, "no crop/frame temp dirs left behind");
+
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });
 console.log("ALL HARNESS TESTS PASSED");

@@ -171,9 +171,14 @@ export interface SwapTextSpec {
 export function buildSwapText(spec: SwapTextSpec): string {
 	const dims = spec.dimensions ? `${spec.dimensions.width}x${spec.dimensions.height} px; ` : "";
 	const describedBy = spec.describedBy ? `described by ${spec.describedBy}; ` : "";
+	// The region zoom is only offered when the model can construct pixel
+	// coordinates — i.e. when the dimensions were published above.
+	const regionHint = spec.dimensions
+		? `, or with region [x, y, w, h] in image pixels (against the dimensions above) to zoom into part of it`
+		: "";
 	return (
 		`[Image ${spec.fingerprint}${spec.origin ?? ""} — ${dims}${describedBy}` +
 		`this model cannot view images directly]\n${spec.description}\n` +
-		`[end of image ${spec.fingerprint}; call ${IMAGE_TOOL} with fingerprint "${spec.fingerprint}" to re-examine it with a focused question]`
+		`[end of image ${spec.fingerprint}; call ${IMAGE_TOOL} with fingerprint "${spec.fingerprint}" to re-examine it with a focused question${regionHint}]`
 	);
 }

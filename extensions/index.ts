@@ -70,6 +70,7 @@ import {
 	type VisionCandidate,
 } from "../src/vision.ts";
 import { ANALYSIS_MODES, buildSwapText, IMAGE_TOOL, modesGuidanceList, resolveModePrompt } from "../src/prompts.ts";
+import { clampRegion, cropImage, parseImageDimensions, type ImageDimensions, type Region } from "../src/image.ts";
 import { analyzeVideo, probeVideo, VIDEO_EXTENSIONS, videoFingerprint } from "../src/video.ts";
 
 const VIDEO_TOOL = "describe_video";
@@ -87,6 +88,7 @@ interface ToolDetails {
 	model: string;
 	question?: string;
 	mode?: string;
+	region?: number[];
 	cached: boolean;
 	media?: "image" | "video";
 	frames?: number;
@@ -271,6 +273,18 @@ export default function visionBridge(pi: ExtensionAPI) {
 		return `q:${JSON.stringify([args.fingerprint, args.mode ?? null, args.region ?? null, args.question ?? null])}`;
 	}
 
+	/**
+	 * Pixel dimensions per image fingerprint, parsed once from the image
+	 * header (no model call, no re-encode). Unknown formats stay undefined.
+	 */
+	const dimsCache = new Map<string, ImageDimensions | null>();
+	function imageDimensions(image: ImageContent, fp: string): ImageDimensions | undefined {
+		if (!dimsCache.has(fp)) {
+			dimsCache.set(fp, parseImageDimensions(Buffer.from(image.data, "base64")) ?? null);
+		}
+		return dimsCache.get(fp) ?? undefined;
+	}
+
 	/** Collect every image present in request messages, in order, deduped by hash. */
 	function collectImages(messages: AgentMessage[]): { refs: Map<string, ImageRef>; order: string[] } {
 		const refs = new Map<string, ImageRef>();
@@ -356,6 +370,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 				const description = descriptions.get(fp);
 				if (description === undefined) continue;
 				const model = models.get(fp);
+				const ref = refs.get(fp);
 				msg.content[i] = {
 					type: "text",
 					text: buildSwapText({
@@ -363,7 +378,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 						description,
 						origin: msg.role === "toolResult" ? ` (from ${msg.toolName ?? "tool"} output)` : undefined,
 						describedBy: model && model !== "unavailable" ? model : undefined,
-						dimensions: undefined, // filled in by the dimensions ticket
+						dimensions: ref ? imageDimensions(ref.image, fp) : undefined,
 					}),
 				};
 			}
@@ -427,6 +442,8 @@ export default function visionBridge(pi: ExtensionAPI) {
 			"specific line, a color, a small region, or a comparison. Pass the fingerprint from the image's tag; " +
 			"omit it to inspect the most recent image. Pass `question` describing exactly what to look for; " +
 			"omit it for a full fresh description. " +
+			"Pass `region` as [x, y, w, h] in image pixels (the image's dimensions are published in its " +
+			"[Image …] description) to zoom into part of it — the crop alone is analyzed. " +
 			"Optional `mode` tunes how the image is read — use when: " +
 			`${modesGuidanceList()}. ` +
 			"Without a mode you get a thorough generic description.",
@@ -454,6 +471,14 @@ export default function visionBridge(pi: ExtensionAPI) {
 						"ui (component and layout inventory — use on interface screenshots), " +
 						"diagram (nodes, arrows, relationships — use on flowcharts and architecture), " +
 						"chart (axes, series, values — use on plots and graphs). Omit for a generic thorough description.",
+				}),
+			),
+			region: Type.Optional(
+				Type.Tuple([Type.Number(), Type.Number(), Type.Number(), Type.Number()], {
+					description:
+						"[x, y, w, h] in image pixel coordinates, against the dimensions published in the image's " +
+						"[Image …] description. That region is cropped out and the crop alone is analyzed — " +
+						"use it to zoom into a part of the image. Out-of-bounds boxes are clamped; zero-area boxes error.",
 				}),
 			),
 		}),
@@ -546,6 +571,71 @@ export default function visionBridge(pi: ExtensionAPI) {
 				};
 			}
 
+			// Region: [x, y, w, h] pixels against the published dimensions.
+			// Invalid boxes are clamped (noted in the result); zero/negative
+			// area is a clear error; unknown dimensions cannot be clamped.
+			let region: Region | undefined;
+			let regionOriginal: number[] | undefined;
+			let regionClamped = false;
+			let regionDims: ImageDimensions | undefined;
+			if (params.region !== undefined) {
+				const raw = params.region;
+				if (!Array.isArray(raw) || raw.length !== 4 || !raw.every((n) => typeof n === "number" && Number.isFinite(n))) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Invalid region ${JSON.stringify(raw)}: region must be [x, y, w, h] with four numbers in image pixels. Retry with a proper box.`,
+							},
+						],
+						details: { fingerprint: target.fingerprint, model: "", question: params.question, mode, cached: false },
+						isError: true,
+					};
+				}
+				if (raw[2] <= 0 || raw[3] <= 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Region [${raw.join(", ")}] has zero or negative area. Provide a region with positive width and height.`,
+							},
+						],
+						details: { fingerprint: target.fingerprint, model: "", question: params.question, mode, cached: false },
+						isError: true,
+					};
+				}
+				regionDims = imageDimensions(target.image, target.fingerprint);
+				if (!regionDims) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Cannot analyze a region of image ${target.fingerprint}: its pixel dimensions could not be determined from the image data ` +
+									`(unsupported or unrecognized format). Describe the whole image instead, without a region.`,
+							},
+						],
+						details: { fingerprint: target.fingerprint, model: "", question: params.question, mode, cached: false },
+						isError: true,
+					};
+				}
+				const clamped = clampRegion(raw, regionDims);
+				if (clamped.region.w <= 0 || clamped.region.h <= 0) {
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Region [${raw.join(", ")}] lies entirely outside the image (${regionDims.width}x${regionDims.height} px). Provide a region that overlaps the image.`,
+							},
+						],
+						details: { fingerprint: target.fingerprint, model: "", question: params.question, mode, cached: false },
+						isError: true,
+					};
+				}
+				region = clamped.region;
+				regionOriginal = [...raw];
+				regionClamped = clamped.clamped;
+			}
+
 			// Targeted answers are cached per (image, mode, question) — every
 			// analysis-shaping input is in the key, so two modes over the same
 			// image are two analyses, and the common retry loop (model re-asking
@@ -553,34 +643,84 @@ export default function visionBridge(pi: ExtensionAPI) {
 			const cacheKey = toolCacheKey({
 				fingerprint: target.fingerprint,
 				mode,
+				region: region ? [region.x, region.y, region.w, region.h] : undefined,
 				question: params.question,
 			});
 			const hit = cacheGet(cacheKey);
 			if (hit) {
 				return {
 					content: [{ type: "text", text: hit.description }],
-					details: { fingerprint: target.fingerprint, model: hit.model, question: params.question, mode, cached: true },
+					details: {
+						fingerprint: target.fingerprint,
+						model: hit.model,
+						question: params.question,
+						mode,
+						region: region ? [region.x, region.y, region.w, region.h] : undefined,
+						cached: true,
+					},
 				};
+			}
+
+			// On a cache miss only: cut the crop and analyze the crop alone.
+			let analysisImage = target.image;
+			if (region) {
+				try {
+					analysisImage = await cropImage(target.image, region, { signal: ctx.signal });
+				} catch (err) {
+					const message = err instanceof Error ? err.message : String(err);
+					return {
+						content: [
+							{
+								type: "text",
+								text: `Could not crop region [${region.x}, ${region.y}, ${region.w}, ${region.h}] from image ${target.fingerprint}: ${message}. ` +
+									`The image format may need ffmpeg on PATH for region analysis; PNG is cropped natively.`,
+							},
+						],
+						details: { fingerprint: target.fingerprint, model: "", question: params.question, mode, cached: false },
+						isError: true,
+					};
+				}
 			}
 
 			const prompt = mode ? resolveModePrompt(mode, params.question) : undefined;
 			const started = Date.now();
 			const { result } = await runWithFallback(ctx, (model) =>
-				analyzeImage(ctx, model, target!.image, {
+				analyzeImage(ctx, model, analysisImage, {
 					prompt,
 					question: params.question,
 					maxTokens: config.maxTokens,
 					temperature: config.temperature,
 				}),
 			);
-			cacheSet(cacheKey, { description: result.description, model: result.model });
-			debug("tool described", target.fingerprint, `${Date.now() - started}ms`);
+			// The result names the region (post-clamping) so the model can cite it.
+			const regionPrefix = region
+				? `Region [${region.x}, ${region.y}, ${region.w}, ${region.h}] of image ${target.fingerprint} ` +
+					`(image is ${regionDims!.width}x${regionDims!.height} px` +
+					`${regionClamped ? `, clamped from [${regionOriginal!.join(", ")}]` : ""}):
+
+`
+				: "";
+			const text = `${regionPrefix}${result.description}`;
+			cacheSet(cacheKey, { description: text, model: result.model });
+			debug(
+				"tool described",
+				target.fingerprint,
+				region ? `region [${region.x},${region.y},${region.w},${region.h}]` : "",
+				`${Date.now() - started}ms`,
+			);
 
 			return {
-				content: [{ type: "text", text: result.description }],
+				content: [{ type: "text", text }],
 				// usage from the nested call keeps session statistics accurate.
 				usage: result.usage,
-				details: { fingerprint: target.fingerprint, model: result.model, question: params.question, mode, cached: false },
+				details: {
+					fingerprint: target.fingerprint,
+					model: result.model,
+					question: params.question,
+					mode,
+					region: region ? [region.x, region.y, region.w, region.h] : undefined,
+					cached: false,
+				},
 			};
 		},
 	});
