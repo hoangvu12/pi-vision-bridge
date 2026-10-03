@@ -650,6 +650,19 @@ assert.equal(capturedCalls.length, 2, "different region: separate analysis");
 await imageTool.execute("rc4", {}, undefined, undefined, regionCacheCtx);
 assert.equal(capturedCalls.length, 3, "no-region analysis never aliases a region entry");
 
+// --- a different raw box that clamps to the same effective region is a hit,
+// but the clamping notice must cite THIS call's raw box, not a stale one ---
+// 540+100 = 640 = the image's right edge, so [540,20,150,50] and [540,20,200,50]
+// both clamp to the same effective [540,20,100,50].
+const edgeHit1 = await imageTool.execute("rc5", { region: [540, 20, 150, 50] }, undefined, undefined, regionCacheCtx);
+assert.equal(capturedCalls.length, 4, "box extending past the right edge: fresh analysis");
+assert.ok(/clamped from \[540, 20, 150, 50\]/.test(edgeHit1.content[0].text), "first call cites its own raw box");
+const edgeHit2 = await imageTool.execute("rc6", { region: [540, 20, 200, 50] }, undefined, undefined, regionCacheCtx);
+assert.equal(capturedCalls.length, 4, "different raw box, same effective region: cache hit");
+assert.ok(edgeHit2.content[0].text.includes("Region [540, 20, 100, 50]"), "hit states the effective region");
+assert.ok(/clamped from \[540, 20, 200, 50\]/.test(edgeHit2.content[0].text), "clamping notice cites the current raw box, not a stale one");
+assert.ok(!/clamped from \[540, 20, 150, 50\]/.test(edgeHit2.content[0].text), "stale raw box not reused");
+
 // --- real cropping against the repo's test image (end-to-end mechanics) ---
 setCropperForTests(undefined);
 const realImage = { type: "image", data: testImageBytes.toString("base64"), mimeType: "image/png" };

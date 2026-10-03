@@ -130,11 +130,6 @@ Rules:
 	},
 };
 
-/** Human/mode-name line for docs and errors. */
-export function modeGuidance(mode: AnalysisMode): string {
-	return MODE_TEMPLATES[mode].guidance;
-}
-
 /** All modes with one-line guidance, for tool descriptions. */
 export function modesGuidanceList(): string {
 	return ANALYSIS_MODES.map((m) => `${m} (${MODE_TEMPLATES[m].guidance})`).join(", ");
@@ -171,6 +166,30 @@ export function buildCompareUserText(first: string, second: string, question?: s
 		`(text, layout, state, color), what stayed the same, and which image each difference belongs to. ` +
 		`Refer to them as "image ${first}" and "image ${second}".` +
 		(question ? `\n\nFocus on: ${question}` : "")
+	);
+}
+
+/** Header line for a comparison result: maps first/second to fingerprints.
+ *  Composed per call so a reversed-order cache hit still labels correctly. */
+export function composeCompareText(first: string, second: string, description: string): string {
+	return `Compared image ${first} (first) with image ${second} (second):\n\n${description}`;
+}
+
+/** Result wrapper for a region analysis: states which region was analyzed
+ *  (post-clamping) and, when clamping changed it, what was originally asked.
+ *  Composed per call so a cache hit reports the current call's raw box. */
+export function composeRegionText(args: {
+	fingerprint: string;
+	dimensions: { width: number; height: number };
+	region: { x: number; y: number; w: number; h: number };
+	original?: number[];
+	clamped: boolean;
+	description: string;
+}): string {
+	return (
+		`Region [${args.region.x}, ${args.region.y}, ${args.region.w}, ${args.region.h}] of image ${args.fingerprint} ` +
+		`(image is ${args.dimensions.width}x${args.dimensions.height} px` +
+		`${args.clamped && args.original ? `, clamped from [${args.original.join(", ")}]` : ""}):\n\n${args.description}`
 	);
 }
 

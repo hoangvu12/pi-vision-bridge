@@ -61,7 +61,6 @@ import {
 	type BridgeConfig,
 	CONFIG_PATH,
 	debug,
-	describeConfig,
 	isEnvDisabled,
 	loadConfig,
 	saveConfig,
@@ -82,6 +81,8 @@ import {
 	buildCompareUserText,
 	buildSwapText,
 	COMPARE_SYSTEM_PROMPT,
+	composeCompareText,
+	composeRegionText,
 	IMAGE_TOOL,
 	modesGuidanceList,
 	resolveModePrompt,
@@ -92,6 +93,11 @@ import { analyzeVideo, probeVideo, VIDEO_EXTENSIONS, videoFingerprint } from "..
 const VIDEO_TOOL = "describe_video";
 const COMPARE_TOOL = "compare_images";
 const VIDEO_HINT_SECTION = "vision_bridge_video";
+
+/** Shared error text for "every candidate is down" across the three tools. */
+const NO_VISION_MODEL_MESSAGE =
+	"No vision-capable model is currently available (every connected candidate failed recently, likely an upstream outage). " +
+	"Tell the user to retry later or connect another vision model.";
 
 interface CacheEntry {
 	description: string;
@@ -285,24 +291,13 @@ export default function visionBridge(pi: ExtensionAPI) {
 
 	/** Collect every image present in the persisted session branch, in order. */
 	function collectSessionImages(ctx: ExtensionContext): ImageRef[] {
-		const images: ImageRef[] = [];
+		const messages: AgentMessage[] = [];
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type !== "message") continue;
 			const msg = (entry as { message?: AgentMessage }).message;
-			if (!msg || (msg.role !== "user" && msg.role !== "toolResult")) continue;
-			if (!Array.isArray(msg.content)) continue;
-			for (const block of msg.content) {
-				if (block.type === "image") {
-					images.push({
-						image: block,
-						fingerprint: fingerprint(block),
-						messageRole: msg.role,
-						toolName: msg.role === "toolResult" ? (msg as ToolResultMessage).toolName : undefined,
-					});
-				}
-			}
+			if (msg) messages.push(msg);
 		}
-		return images;
+		return imagesInMessages(messages);
 	}
 
 	/** Match a model-supplied fingerprint: exact, or a unique-ish prefix. */
@@ -316,6 +311,16 @@ export default function visionBridge(pi: ExtensionAPI) {
 		return images
 			.map((ref) => `  ${ref.fingerprint} (${ref.messageRole}${ref.toolName ? ` from ${ref.toolName}` : ""})`)
 			.join("\n");
+	}
+
+	/** Region as a plain [x, y, w, h] array (details, cache keys). */
+	function regionToArray(region: Region): number[] {
+		return [region.x, region.y, region.w, region.h];
+	}
+
+	/** Shared "unknown fingerprint" error with the retry affordance. */
+	function noFingerprintError(wanted: string, images: ImageRef[]): string {
+		return `No image with fingerprint "${wanted}". Images in this conversation:\n${listImages(images)}\nRetry with one of these exact fingerprints.`;
 	}
 
 	/**
@@ -338,25 +343,28 @@ export default function visionBridge(pi: ExtensionAPI) {
 			recentDistinct.push(ref);
 		}
 
-		const first = firstSpec ? findByFingerprint(images, firstSpec) : undefined;
-		const second = secondSpec ? findByFingerprint(images, secondSpec) : undefined;
-		if ((firstSpec && !first) || (secondSpec && !second)) {
-			return { ok: false, error: `No image with fingerprint "${firstSpec && !first ? firstSpec : secondSpec}". Images in this conversation:
-${listImages(images)}
-Retry with one of these exact fingerprints.` };
+		const explicitFirst = firstSpec ? findByFingerprint(images, firstSpec) : undefined;
+		const explicitSecond = secondSpec ? findByFingerprint(images, secondSpec) : undefined;
+		if ((firstSpec && !explicitFirst) || (secondSpec && !explicitSecond)) {
+			const wanted = firstSpec && !explicitFirst ? firstSpec : secondSpec;
+			return { ok: false, error: noFingerprintError(wanted ?? "", images) };
 		}
 
 		// The SECOND slot prefers the most recent distinct image (the
 		// "newer" version); the FIRST slot then resolves to the most recent
 		// remaining one — so omitted pair = (earlier, later) of the two most
 		// recent distinct images.
-		const b = second ?? (first ? recentDistinct.find((r) => r.fingerprint !== first.fingerprint) : recentDistinct[0]);
-		const a =
-			first ??
-			(second
-				? recentDistinct.find((r) => r.fingerprint !== second.fingerprint)
-				: recentDistinct.find((r) => r !== b));
-		if (!a || !b) {
+		const secondRef =
+			explicitSecond ??
+			(explicitFirst
+				? recentDistinct.find((r) => r.fingerprint !== explicitFirst.fingerprint)
+				: recentDistinct[0]);
+		const firstRef =
+			explicitFirst ??
+			(explicitSecond
+				? recentDistinct.find((r) => r.fingerprint !== explicitSecond.fingerprint)
+				: recentDistinct.find((r) => r !== secondRef));
+		if (!firstRef || !secondRef) {
 			return {
 				ok: false,
 				error:
@@ -365,10 +373,13 @@ Retry with one of these exact fingerprints.` };
 						: "No images are attached to this conversation, so there is nothing to compare.",
 			};
 		}
-		if (a.fingerprint === b.fingerprint) {
-			return { ok: false, error: `Both fingerprints resolve to the same image (${a.fingerprint}); comparing an image with itself is not useful. Choose two different images.` };
+		if (firstRef.fingerprint === secondRef.fingerprint) {
+			return {
+				ok: false,
+				error: `Both fingerprints resolve to the same image (${firstRef.fingerprint}); comparing an image with itself is not useful. Choose two different images.`,
+			};
 		}
-		return { ok: true, first: a, second: b };
+		return { ok: true, first: firstRef, second: secondRef };
 	}
 
 	/**
@@ -398,25 +409,33 @@ Retry with one of these exact fingerprints.` };
 		return dimsCache.get(fp) ?? undefined;
 	}
 
-	/** Collect every image present in request messages, in order, deduped by hash. */
-	function collectImages(messages: AgentMessage[]): { refs: Map<string, ImageRef>; order: string[] } {
-		const refs = new Map<string, ImageRef>();
-		const order: string[] = [];
+	/** Every image block in a message list, in order, with its attribution. */
+	function imagesInMessages(messages: AgentMessage[]): ImageRef[] {
+		const images: ImageRef[] = [];
 		for (const msg of messages) {
 			if (msg.role !== "user" && msg.role !== "toolResult") continue;
 			if (!Array.isArray(msg.content)) continue;
 			for (const block of msg.content) {
 				if (block.type !== "image") continue;
-				const fp = fingerprint(block);
-				if (!refs.has(fp)) {
-					refs.set(fp, {
-						image: block,
-						fingerprint: fp,
-						messageRole: msg.role,
-						toolName: msg.role === "toolResult" ? (msg as ToolResultMessage).toolName : undefined,
-					});
-					order.push(fp);
-				}
+				images.push({
+					image: block,
+					fingerprint: fingerprint(block),
+					messageRole: msg.role,
+					toolName: msg.role === "toolResult" ? (msg as ToolResultMessage).toolName : undefined,
+				});
+			}
+		}
+		return images;
+	}
+
+	/** Collect every image present in request messages, deduped by hash, in order. */
+	function collectImages(messages: AgentMessage[]): { refs: Map<string, ImageRef>; order: string[] } {
+		const refs = new Map<string, ImageRef>();
+		const order: string[] = [];
+		for (const ref of imagesInMessages(messages)) {
+			if (!refs.has(ref.fingerprint)) {
+				refs.set(ref.fingerprint, ref);
+				order.push(ref.fingerprint);
 			}
 		}
 		return { refs, order };
@@ -636,7 +655,7 @@ Retry with one of these exact fingerprints.` };
 						content: [
 							{
 								type: "text",
-								text: `No image with fingerprint "${params.fingerprint}". Images in this conversation:\n${listImages(images)}\nRetry with one of these exact fingerprints.`,
+								text: noFingerprintError(params.fingerprint, images),
 							},
 						],
 						details: { fingerprint: params.fingerprint, model: "", cached: false },
@@ -652,7 +671,7 @@ Retry with one of these exact fingerprints.` };
 					content: [
 						{
 							type: "text",
-							text: "No vision-capable model is currently available (every connected candidate failed recently, likely an upstream outage). Tell the user to retry later or connect another vision model.",
+							text: NO_VISION_MODEL_MESSAGE,
 						},
 					],
 					details: { fingerprint: target.fingerprint, model: "", cached: false },
@@ -746,19 +765,23 @@ Retry with one of these exact fingerprints.` };
 			const cacheKey = toolCacheKey({
 				fingerprint: target.fingerprint,
 				mode,
-				region: region ? [region.x, region.y, region.w, region.h] : undefined,
+				region: region ? regionToArray(region) : undefined,
 				question: params.question,
 			});
 			const hit = cacheGet(cacheKey);
 			if (hit) {
+				// The region wrapper is recomposed per call so a hit always
+				// reports THIS call's raw box in any clamping notice.
 				return {
-					content: [{ type: "text", text: hit.description }],
+					content: [
+						{ type: "text", text: region ? composeRegionResult(hit.description) : hit.description },
+					],
 					details: {
 						fingerprint: target.fingerprint,
 						model: hit.model,
 						question: params.question,
 						mode,
-						region: region ? [region.x, region.y, region.w, region.h] : undefined,
+						region: region ? regionToArray(region) : undefined,
 						cached: true,
 					},
 				};
@@ -795,16 +818,9 @@ Retry with one of these exact fingerprints.` };
 					temperature: config.temperature,
 				}),
 			);
-			// The result names the region (post-clamping) so the model can cite it.
-			const regionPrefix = region
-				? `Region [${region.x}, ${region.y}, ${region.w}, ${region.h}] of image ${target.fingerprint} ` +
-					`(image is ${regionDims!.width}x${regionDims!.height} px` +
-					`${regionClamped ? `, clamped from [${regionOriginal!.join(", ")}]` : ""}):
-
-`
-				: "";
-			const text = `${regionPrefix}${result.description}`;
-			cacheSet(cacheKey, { description: text, model: result.model });
+			// The description alone is cached; the region wrapper is
+			// recomposed per call (see the cache-hit path).
+			cacheSet(cacheKey, { description: result.description, model: result.model });
 			notifyAnalysisDone(ctx, `image described by ${result.model}`, started);
 			debug(
 				"tool described",
@@ -814,7 +830,9 @@ Retry with one of these exact fingerprints.` };
 			);
 
 			return {
-				content: [{ type: "text", text }],
+				content: [
+					{ type: "text", text: region ? composeRegionResult(result.description) : result.description },
+				],
 				// usage from the nested call keeps session statistics accurate.
 				usage: result.usage,
 				details: {
@@ -822,10 +840,22 @@ Retry with one of these exact fingerprints.` };
 					model: result.model,
 					question: params.question,
 					mode,
-					region: region ? [region.x, region.y, region.w, region.h] : undefined,
+					region: region ? regionToArray(region) : undefined,
 					cached: false,
 				},
 			};
+
+			/** The result names the region (post-clamping) so the model can cite it. */
+			function composeRegionResult(description: string): string {
+				return composeRegionText({
+					fingerprint: target!.fingerprint,
+					dimensions: regionDims!,
+					region: region!,
+					original: regionOriginal,
+					clamped: regionClamped,
+					description,
+				});
+			}
 		},
 	});
 
@@ -901,7 +931,7 @@ Retry with one of these exact fingerprints.` };
 					content: [
 						{
 							type: "text",
-							text: "No vision-capable model is currently available (every connected candidate failed recently, likely an upstream outage). Tell the user to retry later or connect another vision model.",
+							text: NO_VISION_MODEL_MESSAGE,
 						},
 					],
 					details: { fingerprint: pairKey(pair), model: "", cached: false },
@@ -916,7 +946,7 @@ Retry with one of these exact fingerprints.` };
 			const hit = cacheGet(cacheKey);
 			if (hit) {
 				return {
-					content: [{ type: "text", text: composeCompareText(pair.first, pair.second, hit.description) }],
+					content: [{ type: "text", text: composeCompareText(pair.first.fingerprint, pair.second.fingerprint, hit.description) }],
 					details: { fingerprint: pairKey(pair), model: hit.model, question: params.question, cached: true },
 				};
 			}
@@ -937,7 +967,7 @@ Retry with one of these exact fingerprints.` };
 			debug("compared", pairKey(pair), `${Date.now() - started}ms`);
 
 			return {
-				content: [{ type: "text", text: composeCompareText(pair.first, pair.second, result.description) }],
+				content: [{ type: "text", text: composeCompareText(pair.first.fingerprint, pair.second.fingerprint, result.description) }],
 				// usage from the nested call keeps session statistics accurate.
 				usage: result.usage,
 				details: { fingerprint: pairKey(pair), model: result.model, question: params.question, cached: false },
@@ -949,10 +979,6 @@ Retry with one of these exact fingerprints.` };
 		},
 	});
 
-	/** Header line for a comparison result: maps first/second to fingerprints. */
-	function composeCompareText(first: ImageRef, second: ImageRef, description: string): string {
-		return `Compared image ${first.fingerprint} (first) with image ${second.fingerprint} (second):\n\n${description}`;
-	}
 
 	/**
 	 * The video path: sample frames with ffmpeg, describe them through the
@@ -1005,7 +1031,7 @@ Retry with one of these exact fingerprints.` };
 					content: [
 						{
 							type: "text",
-							text: "No vision-capable model is currently available (every connected candidate failed recently). Tell the user to retry later or connect another vision model.",
+							text: NO_VISION_MODEL_MESSAGE,
 						},
 					],
 					details: { fingerprint: "", model: "", cached: false, media: "video" },
@@ -1110,24 +1136,22 @@ Retry with one of these exact fingerprints.` };
 	 */
 	function syncToolVisibility(ctx: ExtensionContext): void {
 		const model = ctx.model;
-		const wantImage = config.enabled && !!model && !model.input.includes("image");
-		const wantVideo = config.enabled;
-		const wantCompare = config.enabled;
+		// describe_image only makes sense when the active model cannot see;
+		// the video and compare tools serve every model.
+		const wants: Array<[string, boolean]> = [
+			[IMAGE_TOOL, config.enabled && !!model && !model.input.includes("image")],
+			[VIDEO_TOOL, config.enabled],
+			[COMPARE_TOOL, config.enabled],
+		];
 		const active = pi.getActiveTools();
-		const hasImage = active.includes(IMAGE_TOOL);
-		const hasVideo = active.includes(VIDEO_TOOL);
-		const hasCompare = active.includes(COMPARE_TOOL);
-		if (wantImage === hasImage && wantVideo === hasVideo && wantCompare === hasCompare) return;
-		let next = [...active];
-		next = wantImage ? (hasImage ? next : [...next, IMAGE_TOOL]) : next.filter((n) => n !== IMAGE_TOOL);
-		next = wantVideo ? (hasVideo ? next : [...next, VIDEO_TOOL]) : next.filter((n) => n !== VIDEO_TOOL);
-		next = wantCompare ? (hasCompare ? next : [...next, COMPARE_TOOL]) : next.filter((n) => n !== COMPARE_TOOL);
-		debug(
-			"tool visibility",
-			`image:${wantImage ? "show" : "hide"}`,
-			`video:${wantVideo ? "show" : "hide"}`,
-			`compare:${wantCompare ? "show" : "hide"}`,
-		);
+		if (wants.every(([name, want]) => active.includes(name) === want)) return;
+		const next = [...active];
+		for (const [name, want] of wants) {
+			const has = next.includes(name);
+			if (want && !has) next.push(name);
+			else if (!want && has) next.splice(next.indexOf(name), 1);
+		}
+		debug("tool visibility", ...wants.map(([name, want]) => `${name}:${want ? "show" : "hide"}`));
 		pi.setActiveTools(next);
 	}
 
