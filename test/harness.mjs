@@ -1086,6 +1086,25 @@ notifications.length = 0;
 await registered.commands.visionbridge.handler("status", piSettingsCtx({ visionModels: ["test/pi-settings-model"] }));
 assert.ok(notifyLines().includes("from pi settings"), "status names the pi-settings source");
 
+// --- the in-context swap path also honors the pi-settings section ---
+const swapSettingsCtx = piSettingsCtx({ visionModels: ["test/pi-settings-model"] });
+capturedCalls.length = 0;
+const swapFromSettings = await handlers.context[0](
+	{
+		type: "context",
+		messages: structuredClone([
+			{ role: "user", content: [makeImage("swap-settings", [300, 200])], timestamp: 1 },
+		]),
+	},
+	{ ...swapSettingsCtx, model: fakeModel(["text"]) },
+);
+assert.ok(swapFromSettings, "swap ran with a settings-configured model");
+assert.ok(
+	capturedCalls.some((c) => c.model.id === "pi-settings-model"),
+	"context swap analyzes via the model from the visionBridge section",
+);
+assert.ok(swapFromSettings.messages[0].content[0].text.includes("pi settings ok"), "swap text carries the description");
+
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });
 console.log("ALL HARNESS TESTS PASSED");

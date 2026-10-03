@@ -512,6 +512,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 	 * edits never touch the persisted history.
 	 */
 	pi.on("context", async (event, ctx) => {
+		refreshConfig(ctx); // config and pi-settings may have changed between requests
 		if (!config.enabled) return;
 		const model = ctx.model;
 		if (!model || model.input.includes("image")) return; // native vision: passthrough
@@ -599,6 +600,7 @@ export default function visionBridge(pi: ExtensionAPI) {
 	 * stays out of the way otherwise.
 	 */
 	pi.on("before_agent_start", (event, ctx) => {
+		refreshConfig(ctx);
 		if (!config.enabled) return;
 		const refs = findVideoReferences(event.prompt, ctx.cwd);
 		if (refs.length === 0) {
