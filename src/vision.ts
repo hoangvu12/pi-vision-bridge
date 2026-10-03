@@ -23,6 +23,7 @@
 import { createHash } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { ImageContent, Message, Model, Usage } from "@earendil-works/pi-ai";
+import { buildQuestionPrompt, GENERIC_SYSTEM_PROMPT, GENERIC_USER_PROMPT } from "./prompts.ts";
 import { debug } from "./config.ts";
 
 export interface VisionCandidate {
@@ -47,24 +48,21 @@ export function fingerprint(image: ImageContent): string {
 	return createHash("sha256").update(image.mimeType).update(":").update(image.data).digest("hex").slice(0, 10);
 }
 
-const SYSTEM_PROMPT = `You are the vision stage of a coding assistant that cannot view images directly. Another language model — not a human — will read your output as its only view of the image.
+/** Prompt spec for a nested analysis call. Unspecified fields fall back to the generic image-analysis prompt. */
+export interface AnalysisPromptSpec {
+	/** System prompt override. */
+	systemPrompt?: string;
+	/** User text override. Wins over `question`. */
+	userText?: string;
+}
 
-Produce one complete, standalone text description of the image. Priorities, in order:
-
-1. TEXT FIRST: transcribe ALL visible text verbatim — error messages, code, terminal output, labels, buttons, headings, table cells, axis labels. Preserve line breaks, indentation, and layout order. Text accuracy matters more than anything else. Mark any character you are unsure about with "‹?›" instead of guessing.
-2. STRUCTURE: if it is a screenshot or UI, describe the window/application, regions (header, sidebar, main content, dialogs), the key components, their states (selected, disabled, loading, error), and the overall layout top-to-bottom.
-3. DATA: if it is a diagram or chart, describe nodes, labeled arrows and their direction, axes, series, units, and the important values.
-4. VISUAL FACTS: salient colors, counts, sizes, and positions of notable elements.
-
-Rules:
-- Describe only what is visible. Explicitly mark inferences as uncertain; never invent text or details.
-- Plain text/markdown only. No preamble like "This image shows", no advice, no questions, no concluding remarks.
-- Be thorough but do not pad: every sentence must carry information about the image.`;
-
-const GENERIC_USER_PROMPT = "Describe this image.";
-
-function buildQuestionPrompt(question: string): string {
-	return `Answer this question about the image, with the transcription precision of an OCR pass for anything textual it touches:\n\n${question}`;
+export interface AnalyzeOptions {
+	/** Injectable prompt spec; reaches the model call verbatim. */
+	prompt?: AnalysisPromptSpec;
+	/** Focused question; used when no prompt.userText override is given. */
+	question?: string;
+	maxTokens?: number;
+	temperature?: number;
 }
 
 /**
@@ -168,34 +166,39 @@ export function isRetryableFailure(error: unknown): boolean {
 }
 
 /**
- * Run one image (optionally with a focused question) through a vision model.
- * Uses a plain no-tools model call: the image and the fixed system prompt only.
+ * Run one or many images through a vision model in a single model request,
+ * with an injectable prompt spec (system prompt + user text). Without an
+ * override this is today's generic image analysis (question or generic).
+ * Uses a plain no-tools model call: the images and a fixed prompt only.
  */
-export async function analyzeImage(
+export async function analyzeImages(
 	ctx: ExtensionContext,
 	model: Model<any>,
-	image: ImageContent,
-	options?: { question?: string; maxTokens?: number; temperature?: number },
+	images: ImageContent[],
+	options?: AnalyzeOptions,
 ): Promise<VisionAnalysis> {
+	const userText =
+		options?.prompt?.userText ?? (options?.question ? buildQuestionPrompt(options.question) : GENERIC_USER_PROMPT);
+
+	const content: Array<ImageContent | { type: "text"; text: string }> = images.map((image) => ({
+		type: "image",
+		data: image.data,
+		mimeType: image.mimeType,
+	}));
+	content.push({ type: "text", text: userText });
 	const messages: Message[] = [
 		{
 			role: "user",
-			content: [
-				{ type: "image", data: image.data, mimeType: image.mimeType },
-				{
-					type: "text",
-					text: options?.question ? buildQuestionPrompt(options.question) : GENERIC_USER_PROMPT,
-				},
-			],
+			content,
 			timestamp: Date.now(),
 		},
 	];
 
-	debug("vision call", model.provider, model.id, `question=${options?.question ? "yes" : "generic"}`);
+	debug("vision call", model.provider, model.id, `${images.length} image${images.length === 1 ? "" : "s"}`, options?.prompt ? "prompt=custom" : options?.question ? "question=yes" : "generic");
 
 	const response = await ctx.modelRegistry.complete(
 		model,
-		{ systemPrompt: SYSTEM_PROMPT, messages },
+		{ systemPrompt: options?.prompt?.systemPrompt ?? GENERIC_SYSTEM_PROMPT, messages },
 		{
 			signal: ctx.signal,
 			maxTokens: options?.maxTokens,
@@ -224,4 +227,14 @@ export async function analyzeImage(
 	}
 
 	return { description, model: `${model.provider}/${model.id}`, usage: response.usage };
+}
+
+/** Analyze one image — the one-image convenience form of analyzeImages. */
+export function analyzeImage(
+	ctx: ExtensionContext,
+	model: Model<any>,
+	image: ImageContent,
+	options?: AnalyzeOptions,
+): Promise<VisionAnalysis> {
+	return analyzeImages(ctx, model, [image], options);
 }

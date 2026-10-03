@@ -69,9 +69,9 @@ import {
 	type VisionAnalysis,
 	type VisionCandidate,
 } from "../src/vision.ts";
+import { buildSwapText, IMAGE_TOOL } from "../src/prompts.ts";
 import { analyzeVideo, probeVideo, VIDEO_EXTENSIONS, videoFingerprint } from "../src/video.ts";
 
-const IMAGE_TOOL = "describe_image";
 const VIDEO_TOOL = "describe_video";
 const VIDEO_HINT_SECTION = "vision_bridge_video";
 
@@ -339,14 +339,16 @@ export default function visionBridge(pi: ExtensionAPI) {
 				const fp = fingerprint(block);
 				const description = descriptions.get(fp);
 				if (description === undefined) continue;
-				const origin = msg.role === "toolResult" ? ` (from ${msg.toolName ?? "tool"} output)` : "";
-				const describedBy = models.get(fp) && models.get(fp) !== "unavailable" ? `described by ${models.get(fp)}; ` : "";
+				const model = models.get(fp);
 				msg.content[i] = {
 					type: "text",
-					text:
-						`[Image ${fp}${origin} — ${describedBy}` +
-						`this model cannot view images directly]\n${description}\n` +
-						`[end of image ${fp}; call ${IMAGE_TOOL} with fingerprint "${fp}" to re-examine it with a focused question]`,
+					text: buildSwapText({
+						fingerprint: fp,
+						description,
+						origin: msg.role === "toolResult" ? ` (from ${msg.toolName ?? "tool"} output)` : undefined,
+						describedBy: model && model !== "unavailable" ? model : undefined,
+						dimensions: undefined, // filled in by the dimensions ticket
+					}),
 				};
 			}
 		}

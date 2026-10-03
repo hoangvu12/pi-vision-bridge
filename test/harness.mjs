@@ -23,6 +23,8 @@ process.env.HOME = fakeHome;
 
 const { default: visionBridge } = await import("../extensions/index.ts");
 const { computeFrameCount, VIDEO_EXTENSIONS } = await import("../src/video.ts");
+const { analyzeImages } = await import("../src/vision.ts");
+const { buildSwapText } = await import("../src/prompts.ts");
 
 // ---- mock pi ----
 const activeTools = ["read", "bash", "edit"];
@@ -252,6 +254,120 @@ assert.equal(computeFrameCount(10, 60, 5), 5, "per-message limit 5 respected");
 assert.equal(computeFrameCount(20, 600), 16, "hard cap 16");
 assert.equal(computeFrameCount(10, 20, 30), 10, "limit above request ignored");
 assert.ok(VIDEO_EXTENSIONS.has(".mp4") && VIDEO_EXTENSIONS.has(".webm"), "video extensions set");
+
+// =====================================================================
+// Ticket 01: generalized analysis seam
+// =====================================================================
+
+// Registry mock that records every nested model call and returns a canned
+// assistant message — the seam through which later tickets assert outgoing
+// prompts, image blocks, and call counts.
+const capturedCalls = [];
+const cannedDescription = "A pixel-perfect description of the image.";
+const cannedUsage = { input: 11, output: 7, cacheRead: 0, cacheWrite: 0 };
+const captureCtx = (model, opts = {}) => ({
+	...ctx(model),
+	modelRegistry: {
+		getAvailable: () => [fakeModel(["text", "image"])],
+		find: (provider, id) => (id === "vision-model" ? fakeModel(["text", "image"]) : undefined),
+		hasConfiguredAuth: () => true,
+		complete: async (calledModel, context, options) => {
+			capturedCalls.push({ model: calledModel, context, options });
+			return {
+				role: "assistant",
+				content: [{ type: "text", text: opts.description ?? cannedDescription }],
+				usage: { ...cannedUsage },
+				stopReason: "stop",
+			};
+		},
+	},
+});
+const vision = fakeModel(["text", "image"]);
+const lastCall = () => capturedCalls[capturedCalls.length - 1];
+const textBlocks = (call) => call.context.messages[0].content.filter((c) => c.type === "text");
+const imageBlocks = (call) => call.context.messages[0].content.filter((c) => c.type === "image");
+
+// --- analyzeImages: multiple images in ONE model request ---
+capturedCalls.length = 0;
+await analyzeImages(captureCtx(vision), vision, [
+	{ type: "image", data: Buffer.from("one").toString("base64"), mimeType: "image/png" },
+	{ type: "image", data: Buffer.from("two").toString("base64"), mimeType: "image/png" },
+]);
+assert.equal(capturedCalls.length, 1, "two images: exactly one model call");
+assert.equal(imageBlocks(lastCall()).length, 2, "two image blocks in the request");
+assert.equal(imageBlocks(lastCall())[0].data, Buffer.from("one").toString("base64"), "first image data");
+assert.equal(imageBlocks(lastCall())[1].data, Buffer.from("two").toString("base64"), "second image data");
+assert.equal(textBlocks(lastCall()).length, 1, "one prompt text block");
+assert.equal(textBlocks(lastCall())[0].text, "Describe this image.", "default prompt text");
+
+// --- analyzeImages: default prompt is today's generic prompt ---
+assert.ok(lastCall().context.systemPrompt.includes("vision stage"), "default system prompt (identity)");
+assert.ok(lastCall().context.systemPrompt.includes("TEXT FIRST"), "default system prompt (OCR priority)");
+
+// --- analyzeImages: injectable prompt spec reaches the model verbatim ---
+capturedCalls.length = 0;
+await analyzeImages(captureCtx(vision), vision, [
+	{ type: "image", data: Buffer.from("x").toString("base64"), mimeType: "image/png" },
+], {
+	prompt: { systemPrompt: "CUSTOM SYSTEM PROMPT", userText: "CUSTOM USER TEXT" },
+});
+assert.equal(lastCall().context.systemPrompt, "CUSTOM SYSTEM PROMPT", "custom system prompt verbatim");
+assert.equal(textBlocks(lastCall())[0].text, "CUSTOM USER TEXT", "custom user text verbatim");
+
+// --- analyzeImages: question still shapes the default user text ---
+capturedCalls.length = 0;
+await analyzeImages(captureCtx(vision), vision, [
+	{ type: "image", data: Buffer.from("y").toString("base64"), mimeType: "image/png" },
+], { question: "what color is the header" });
+assert.ok(
+	textBlocks(lastCall())[0].text.startsWith("Answer this question about the image"),
+	"question prompt shape unchanged",
+);
+assert.ok(textBlocks(lastCall())[0].text.includes("what color is the header"), "question reaches the prompt");
+
+// --- buildSwapText: renders exactly today's wrapper; dims arg renders nothing when absent ---
+assert.equal(
+	buildSwapText({ fingerprint: "abcd1234", description: "DESC", describedBy: "prov/model" }),
+	'[Image abcd1234 — described by prov/model; this model cannot view images directly]\nDESC\n' +
+		'[end of image abcd1234; call describe_image with fingerprint "abcd1234" to re-examine it with a focused question]',
+	"swap text: byte-identical to the pre-refactor wrapper",
+);
+assert.equal(
+	buildSwapText({ fingerprint: "abcd1234", description: "DESC", origin: " (from bash output)" }),
+	'[Image abcd1234 (from bash output) — this model cannot view images directly]\nDESC\n' +
+		'[end of image abcd1234; call describe_image with fingerprint "abcd1234" to re-examine it with a focused question]',
+	"swap text: origin rendered",
+);
+assert.equal(
+	buildSwapText({ fingerprint: "abcd1234", description: "DESC", dimensions: undefined }),
+	buildSwapText({ fingerprint: "abcd1234", description: "DESC" }),
+	"swap text: absent dimensions render nothing",
+);
+assert.ok(
+	buildSwapText({ fingerprint: "abcd1234", description: "DESC", dimensions: { width: 800, height: 600 } }).startsWith(
+		"[Image abcd1234 — 800x600 px; ",
+	),
+	"swap text: dimensions render when present",
+);
+
+// --- end-to-end: context swap still replaces the image with the description ---
+capturedCalls.length = 0;
+notifications.length = 0;
+const swapResult = await handlers.context[0](
+	{ type: "context", messages: structuredClone(withImage) },
+	captureCtx(fakeModel(["text"])),
+);
+assert.ok(swapResult, "context handler returns a swap");
+const swapped = swapResult.messages[0].content[1];
+assert.equal(swapped.type, "text", "image block replaced by text");
+assert.equal(
+	swapped.text,
+	`[Image ${fp} — described by test/vision-model; this model cannot view images directly]\n${cannedDescription}\n` +
+		`[end of image ${fp}; call describe_image with fingerprint "${fp}" to re-examine it with a focused question]`,
+	"end-to-end swap text unchanged by the prefactor",
+);
+assert.equal(capturedCalls.length, 1, "one nested vision call for the swap");
+assert.equal(imageBlocks(lastCall()).length, 1, "swap analysis sends one image");
 
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });
