@@ -18,7 +18,14 @@
  *     process, across turns, retries, and cache warming.
  *  4. describe_image tool (lazy, targeted): the cached description is
  *     deliberately generic so it stays cache-coherent; the tool provides
- *     the focused re-look ("quote the exact error text").
+ *     the focused re-look ("quote the exact error text") — optionally with
+ *     a task mode (ocr/error/ui/diagram/chart: curated readings) or a
+ *     region [x, y, w, h] (the crop alone is analyzed; dimensions are
+ *     published in the swap text so the model can construct boxes).
+ *  4b. compare_images tool: "what changed between these two?" in ONE
+ *     vision call with a diff-oriented prompt; visible to every model —
+ *     even a vision model cannot diff two images it saw in different
+ *     turns without re-attaching them.
  *
  *  VIDEO
  *  5. Videos cannot enter pi messages at all (no video content type), so
@@ -161,6 +168,14 @@ export default function visionBridge(pi: ExtensionAPI) {
 			if (oldest === undefined) break;
 			cache.delete(oldest);
 		}
+	}
+
+	/** Success toast: names the answering vision model and the elapsed time,
+	 *  so the user sees what the bridge spent. Silent without UI or notify. */
+	function notifyAnalysisDone(ctx: ExtensionContext, body: string, startedAt: number): void {
+		if (!ctx.hasUI || !config.notify) return;
+		const seconds = ((Date.now() - startedAt) / 1000).toFixed(1);
+		ctx.ui.notify(`pi-vision-bridge: ${body} in ${seconds}s`, "info");
 	}
 
 	function candidateKey(c: VisionCandidate): string {
@@ -437,6 +452,7 @@ Retry with one of these exact fingerprints.` };
 
 		const descriptions = new Map<string, string>();
 		const models = new Map<string, string>();
+		const batchStarted = Date.now();
 		await Promise.all(
 			order.map(async (fp) => {
 				const ref = refs.get(fp)!;
@@ -456,6 +472,15 @@ Retry with one of these exact fingerprints.` };
 				}
 			}),
 		);
+
+		// Completion toast: what the bridge spent once the batch settles.
+		const freshModels = [
+			...new Set(fresh.map((fp) => models.get(fp)).filter((m): m is string => !!m && m !== "unavailable")),
+		];
+		if (fresh.length > 0 && freshModels.length > 0) {
+			const modelText = freshModels.length > 1 ? `${freshModels[0]} (+${freshModels.length - 1} more)` : freshModels[0];
+			notifyAnalysisDone(ctx, `described ${fresh.length} image${fresh.length > 1 ? "s" : ""} with ${modelText}`, batchStarted);
+		}
 
 		// Swap every image block for its description, in place.
 		for (const msg of event.messages) {
@@ -780,6 +805,7 @@ Retry with one of these exact fingerprints.` };
 				: "";
 			const text = `${regionPrefix}${result.description}`;
 			cacheSet(cacheKey, { description: text, model: result.model });
+			notifyAnalysisDone(ctx, `image described by ${result.model}`, started);
 			debug(
 				"tool described",
 				target.fingerprint,
@@ -907,6 +933,7 @@ Retry with one of these exact fingerprints.` };
 				}),
 			);
 			cacheSet(cacheKey, { description: result.description, model: result.model });
+			notifyAnalysisDone(ctx, `images compared by ${result.model}`, started);
 			debug("compared", pairKey(pair), `${Date.now() - started}ms`);
 
 			return {
@@ -1042,6 +1069,7 @@ Retry with one of these exact fingerprints.` };
 				}),
 			);
 			cacheSet(cacheKey, { description: result.description, model: result.model });
+			notifyAnalysisDone(ctx, `video analyzed by ${result.model} (${result.frames} frames)`, started);
 			debug("video described", fp, `${Date.now() - started}ms`, `${result.frames} frames`);
 
 			return {

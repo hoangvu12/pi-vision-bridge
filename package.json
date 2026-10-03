@@ -1,7 +1,7 @@
 {
 	"name": "pi-vision-bridge",
 	"version": "1.0.0",
-	"description": "Give non-vision pi models the ability to understand images AND video: images are described in-context before the request (plus a describe_image tool for targeted follow-ups), videos are watched via ffmpeg frame sampling through describe_video. Non-destructive, cached, auto-selects a connected vision model with health-based fallback.",
+	"description": "Give non-vision pi models the ability to understand images AND video: images are described in-context before the request (plus a describe_image tool with task modes and region zoom, and a compare_images diff tool), videos are watched via ffmpeg frame sampling through describe_video. Non-destructive, cached, auto-selects a connected vision model with health-based fallback.",
 	"keywords": [
 		"pi-package",
 		"pi-extension",
@@ -11,6 +11,7 @@
 		"multimodal",
 		"describe-image",
 		"describe-video",
+		"compare-images",
 		"vision-bridge",
 		"ffmpeg",
 		"frame-extraction"

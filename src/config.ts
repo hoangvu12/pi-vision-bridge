@@ -33,8 +33,6 @@ export interface BridgeConfig {
 	notify: boolean;
 	/** Default frames sampled per video (bounded by the model's per-message image limit). */
 	videoFrames: number;
-	/** Max remote video download size in MB (local files are streamed, not downloaded). */
-	videoDownloadMaxMB: number;
 }
 
 export const CONFIG_PATH = join(homedir(), ".pi", "agent", "pi-vision-bridge.json");
@@ -47,7 +45,6 @@ const DEFAULTS: BridgeConfig = {
 	cacheMax: 64,
 	notify: true,
 	videoFrames: 10,
-	videoDownloadMaxMB: 100,
 };
 
 export const debug = (...parts: unknown[]): void => {
@@ -87,9 +84,8 @@ export function loadConfig(): BridgeConfig {
 			if (typeof raw.cacheMax === "number" && raw.cacheMax > 0) config.cacheMax = raw.cacheMax;
 			if (typeof raw.notify === "boolean") config.notify = raw.notify;
 			if (typeof raw.videoFrames === "number" && raw.videoFrames > 0) config.videoFrames = raw.videoFrames;
-			if (typeof raw.videoDownloadMaxMB === "number" && raw.videoDownloadMaxMB > 0) {
-				config.videoDownloadMaxMB = raw.videoDownloadMaxMB;
-			}
+			// Unknown fields (e.g. a stale videoDownloadMaxMB from older
+			// versions) are ignored on load, never rejected.
 		} catch (err) {
 			debug("config read failed, using defaults:", err instanceof Error ? err.message : err);
 		}

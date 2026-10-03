@@ -283,6 +283,13 @@ const captureCtx = (model, opts = {}) => ({
 	},
 });
 const vision = fakeModel(["text", "image"]);
+const makeImage = (tag, dims) => ({
+	type: "image",
+	data: dims
+		? makePngHeader(dims[0], dims[1]).toString("base64")
+		: Buffer.from(`image-${tag}`).toString("base64"),
+	mimeType: dims ? "image/png" : "application/octet-stream",
+});
 const lastCall = () => capturedCalls[capturedCalls.length - 1];
 const textBlocks = (call) => call.context.messages[0].content.filter((c) => c.type === "text");
 const imageBlocks = (call) => call.context.messages[0].content.filter((c) => c.type === "image");
@@ -777,6 +784,127 @@ assert.ok(activeTools.includes("compare_images"), "compare back when re-enabled"
 notifications.length = 0;
 await registered.commands.visionbridge.handler("status", ctx(fakeModel(["text"])));
 assert.ok(notifyLines().includes("compare"), "status lists the compare tool");
+
+// =====================================================================
+// Ticket 05: completion toast + config honesty
+// =====================================================================
+
+const uiCaptureCtx = (model) => ({ ...captureCtx(model), hasUI: true });
+
+// --- completion toast on the in-context swap ---
+notifications.length = 0;
+await handlers.context[0](
+	{
+		type: "context",
+		messages: structuredClone([
+			{
+				role: "user",
+				content: [{ type: "image", data: makePngHeader(1024, 768).toString("base64"), mimeType: "image/png" }],
+				timestamp: 1,
+			},
+		]),
+	},
+	uiCaptureCtx(fakeModel(["text"])),
+);
+assert.ok(
+	notifications.map((n) => n.m).some((m) => /described 1 image with .+ in \d+(\.\d+)?s/.test(m)),
+	"swap completion toast names the model and elapsed time",
+);
+
+// --- completion toast on describe_image; cache hit is silent ---
+notifications.length = 0;
+const toastImg = { type: "image", data: makePngHeader(500, 400).toString("base64"), mimeType: "image/png" };
+const imgToastCtx = uiCaptureCtx(fakeModel(["text"]));
+imgToastCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [toastImg], timestamp: 1 } }],
+};
+await imageTool.execute("toast-1", { question: "anything" }, undefined, undefined, imgToastCtx);
+assert.ok(
+	notifications.map((n) => n.m).some((m) => /image described by .+ in \d+(\.\d+)?s/.test(m)),
+	"describe_image completion toast",
+);
+notifications.length = 0;
+await imageTool.execute("toast-2", { question: "anything" }, undefined, undefined, imgToastCtx);
+assert.equal(
+	notifications.filter((n) => n.m.includes("pi-vision-bridge")).length,
+	0,
+	"cache hit: no completion toast (nothing spent)",
+);
+
+// --- completion toast on compare_images ---
+notifications.length = 0;
+const cmpToastCtx = uiCaptureCtx(fakeModel(["text"]));
+cmpToastCtx.sessionManager = {
+	getBranch: () => [
+		{ type: "message", message: { role: "user", content: [makeImage("toast-cmp-a")], timestamp: 1 } },
+		{ type: "message", message: { role: "user", content: [makeImage("toast-cmp-b")], timestamp: 2 } },
+	],
+};
+await compareTool.execute("toast-3", {}, undefined, undefined, cmpToastCtx);
+assert.ok(
+	notifications.map((n) => n.m).some((m) => /images compared by .+ in \d+(\.\d+)?s/.test(m)),
+	"compare completion toast",
+);
+
+// --- failure toast unchanged ---
+notifications.length = 0;
+const failCtx = uiCaptureCtx(fakeModel(["text"]));
+failCtx.modelRegistry.complete = async () => ({
+	role: "assistant",
+	content: [],
+	usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	stopReason: "error",
+	errorMessage: "boom",
+});
+const failSwap = await handlers.context[0](
+	{
+		type: "context",
+		messages: structuredClone([
+			{ role: "user", content: [makeImage("fail-toast")], timestamp: 1 },
+		]),
+	},
+	failCtx,
+);
+assert.ok(
+	notifications.map((n) => n.m).some((m) => /image analysis failed — boom/.test(m)),
+	"failure toast unchanged",
+);
+assert.ok(
+	failSwap.messages[0].content[0].text.includes("[Image analysis failed: boom"),
+	"failure swap text unchanged",
+);
+
+// --- silent when notify is off ---
+writeFileSync(join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"), JSON.stringify({ notify: false }));
+notifications.length = 0;
+const quietCtx = uiCaptureCtx(fakeModel(["text"]));
+quietCtx.sessionManager = {
+	getBranch: () => [{ type: "message", message: { role: "user", content: [makeImage("quiet-img")], timestamp: 1 } }],
+};
+const quietResult = await imageTool.execute("quiet-1", { question: "quiet" }, undefined, undefined, quietCtx);
+assert.ok(quietResult.details.model && !quietResult.isError, "notify off: the analysis still ran");
+assert.equal(
+	notifications.filter((n) => n.m.includes("pi-vision-bridge")).length,
+	0,
+	"notify off: no toasts at all",
+);
+
+// --- videoDownloadMaxMB: cut from config, tolerated when stale ---
+const { loadConfig } = await import("../src/config.ts");
+writeFileSync(
+	join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"),
+	JSON.stringify({ videoDownloadMaxMB: 250, notify: true }),
+);
+const loaded = loadConfig();
+assert.equal(loaded.videoDownloadMaxMB, undefined, "stale videoDownloadMaxMB is ignored, not surfaced");
+assert.equal(loaded.notify, true, "other file fields still load");
+assert.equal(loaded.enabled, true, "defaults intact alongside the stale field");
+await registered.commands.visionbridge.handler("model test/vision-model", ctx(fakeModel(["text"])));
+const savedNow = JSON.parse(readFileSync(join(fakeHome, ".pi", "agent", "pi-vision-bridge.json"), "utf8"));
+assert.ok(!("videoDownloadMaxMB" in savedNow), "persisted config never contains videoDownloadMaxMB");
+notifications.length = 0;
+await registered.commands.visionbridge.handler("status", ctx(fakeModel(["text"])));
+assert.ok(!notifyLines().toLowerCase().includes("download"), "status output never mentions download");
 
 rmSync(fakeHome, { recursive: true, force: true });
 rmSync(workDir, { recursive: true, force: true });
