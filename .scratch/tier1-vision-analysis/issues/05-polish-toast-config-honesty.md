@@ -26,3 +26,7 @@ the field must be tolerated (ignored) on load, not rejected.
 - [ ] Existing harness tests updated where they enumerate config fields, and
       all pass
 - [ ] Typecheck and harness green
+
+## Comments
+
+- Implemented in commit f20f270 + follow-up 97b4227 (completion toasts, videoDownloadMaxMB cut, stale-field tolerance). Video-path toast shares the tested helper; verified via the same code path as image tools.

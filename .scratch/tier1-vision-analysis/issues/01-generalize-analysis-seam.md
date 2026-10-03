@@ -27,3 +27,7 @@ attribution it already renders.
       answers from a swapped-in description; video path unaffected
 - [ ] Health rotation, sticky winner, and caching behavior unchanged
       (existing tests cover this — they must stay green without edits)
+
+## Comments
+
+- Implemented in commit 803c187 (analyzeImages seam + buildSwapText). All harness assertions green; existing tests unmodified. No manual checks left.

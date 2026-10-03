@@ -36,3 +36,7 @@ model can cite it.
 - [ ] Cache key includes region: same image, two regions → two analyses
 - [ ] End-to-end: zooming into a region of the test screenshot yields a
       description focused on that region's content
+
+## Comments
+
+- Implemented in commit 9b1d323 (header dims PNG/JPEG/GIF/WebP, region clamp/crop with native PNG codec + ffmpeg fallback; cropper pixel-identical to ffmpeg's own crop). Manual/demo check outstanding: live region-zoom reading of the test screenshot.

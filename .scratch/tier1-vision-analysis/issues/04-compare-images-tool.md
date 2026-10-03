@@ -36,3 +36,7 @@ different turns without re-attaching them.
 - [ ] End-to-end: comparing two versions of a screenshot yields a
       change-focused answer (manual/demo check — two crops of the repo's
       test image work as the pair)
+
+## Comments
+
+- Implemented in commit afe8dd7 (order-insensitive pair cache, one-call diff, visibility matrix). Manual/demo check outstanding: live compare of two crops of the test image.

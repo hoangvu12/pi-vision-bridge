@@ -31,3 +31,7 @@ thorough description.
 - [ ] End-to-end: an error-bearing screenshot re-examined with
       `mode=error` yields an error-focused reading (manual/demo check
       against the repo's test image)
+
+## Comments
+
+- Implemented in commit cbfe8c0 (five curated mode prompts, schema-restricted mode, cache key includes mode). Manual/demo check outstanding: live vision-model pass over the repo's test image with mode=error.
