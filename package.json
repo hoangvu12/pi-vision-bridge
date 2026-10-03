@@ -1,0 +1,51 @@
+{
+	"name": "pi-vision-bridge",
+	"version": "1.0.0",
+	"description": "Give non-vision pi models the ability to understand images AND video: images are described in-context before the request (plus a describe_image tool for targeted follow-ups), videos are watched via ffmpeg frame sampling through describe_video. Non-destructive, cached, auto-selects a connected vision model with health-based fallback.",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"vision",
+		"image",
+		"video",
+		"multimodal",
+		"describe-image",
+		"describe-video",
+		"vision-bridge",
+		"ffmpeg",
+		"frame-extraction"
+	],
+	"license": "MIT",
+	"type": "module",
+	"exports": {
+		".": {
+			"default": "./extensions/index.ts"
+		}
+	},
+	"engines": {
+		"node": ">=20.3"
+	},
+	"pi": {
+		"extensions": [
+			"./extensions/index.ts"
+		]
+	},
+	"files": [
+		"extensions",
+		"src",
+		"README.md"
+	],
+	"scripts": {
+		"typecheck": "tsc --noEmit"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"typebox": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-coding-agent": "^1.0.1",
+		"@types/node": "^22.10.0",
+		"typebox": "^1.3.34",
+		"typescript": "^5.7.0"
+	}
+}
